@@ -869,11 +869,11 @@ async def tools_call_endpoint(request: Request) -> Response:
             headers=headers,
         )
 
-    # Extrair API Key do header
-    api_key = request.headers.get("X-API-Key")
+    # Extrair API Key (header ou query parameter)
+    api_key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
     if not api_key:
         return JSONResponse(
-            {"error": "Header X-API-Key é obrigatório"},
+            {"error": "API Key é obrigatória (header X-API-Key ou query param api_key)"},
             status_code=401,
             headers=headers,
         )
@@ -960,11 +960,11 @@ async def tools_call_endpoint(request: Request) -> Response:
 
 async def sse_endpoint(request: Request):
     """Endpoint SSE para conexão MCP."""
-    # Extrair API Key
-    api_key = request.headers.get("X-API-Key")
+    # Extrair API Key (header ou query parameter)
+    api_key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
     if not api_key:
         return JSONResponse(
-            {"error": "Header X-API-Key é obrigatório"},
+            {"error": "API Key é obrigatória (header X-API-Key ou query param api_key)"},
             status_code=401,
         )
 
