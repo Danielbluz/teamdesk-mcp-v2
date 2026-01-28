@@ -255,13 +255,8 @@ class ApiKeyValidator:
                 self.cache[api_key] = (result, time.time() + 10)
             return result
 
-        # Obter token do usuário
-        user_token = record.get("Token", "")
-        if not user_token:
-            return ApiKeyValidationResult(
-                valid=False,
-                error="Token do usuário não configurado na API Key"
-            )
+        # Obter token: usa o token individual se existir, senão usa o master
+        user_token = record.get("Token", "") or TEAMDESK_MASTER_TOKEN
 
         # Criar resultado válido
         result = ApiKeyValidationResult(
