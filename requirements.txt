@@ -1,0 +1,14 @@
+# Teamdesk MCP Server v2 - Dependencies
+
+# Core
+httpx>=0.25.0
+mcp>=1.0.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+
+# Web Framework
+starlette>=0.32.0
+uvicorn>=0.24.0
+
+# Note: Rate limiting e cache implementados sem dependências externas
+# usando estruturas em memória com asyncio locks

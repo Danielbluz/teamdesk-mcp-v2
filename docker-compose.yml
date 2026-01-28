@@ -1,0 +1,52 @@
+services:
+  teamdesk-mcp:
+    image: python:3.11-slim
+    container_name: teamdesk-mcp
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - teamdesk_app:/app
+      - teamdesk_pip:/root/.cache/pip
+    command: >
+      bash -c "
+        if [ ! -f /app/src/server.py ]; then
+          echo 'First run: cloning repository...' &&
+          apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1 &&
+          git clone https://github.com/Danielbluz/teamdesk-mcp-v2.git /tmp/repo &&
+          cp -r /tmp/repo/src /tmp/repo/requirements.txt /app/ &&
+          rm -rf /tmp/repo;
+        fi &&
+        pip install -q -r /app/requirements.txt &&
+        echo 'Starting TeamDesk MCP Server...' &&
+        cd /app && python -m uvicorn src.server:app --host 0.0.0.0 --port 8080
+      "
+    environment:
+      - TEAMDESK_DATABASE_ID=101885
+      - TEAMDESK_MASTER_TOKEN=${TEAMDESK_MASTER_TOKEN}
+      - TEAMDESK_API_KEYS_TABLE=API-Keys
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8080
+      - MCP_RATE_LIMIT=100
+      - MCP_CACHE_TTL=300
+      - MCP_API_KEY_CACHE_TTL=60
+      - MCP_CORS_ORIGINS=*
+    networks:
+      - traefik_network
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.teamdesk-mcp.rule=Host(`mcp.forgreen.com.br`)"
+      - traefik.http.routers.teamdesk-mcp.tls=true
+      - traefik.http.routers.teamdesk-mcp.entrypoints=web,websecure
+      - traefik.http.routers.teamdesk-mcp.tls.certresolver=mytlschallenge
+      - traefik.http.services.teamdesk-mcp.loadbalancer.server.port=8080
+      - traefik.http.middlewares.teamdesk-mcp-sse.headers.customresponseheaders.X-Accel-Buffering=no
+      - traefik.http.routers.teamdesk-mcp.middlewares=teamdesk-mcp-sse
+
+volumes:
+  teamdesk_app:
+  teamdesk_pip:
+
+networks:
+  traefik_network:
+    external: true
+    name: root_default

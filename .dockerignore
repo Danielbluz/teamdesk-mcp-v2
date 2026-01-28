@@ -1,0 +1,14 @@
+deploy/
+wrapper/
+tests/
+*.md
+.env
+.env.example
+.git/
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.dockerignore
+Dockerfile
+docker-compose.yml
