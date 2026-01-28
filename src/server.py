@@ -172,13 +172,13 @@ class ApiKeyValidationResult:
         valid: bool,
         token: Optional[str] = None,
         user_name: Optional[str] = None,
-        record_id: Optional[int] = None,
+        api_key: Optional[str] = None,
         error: Optional[str] = None,
     ):
         self.valid = valid
         self.token = token
         self.user_name = user_name
-        self.record_id = record_id
+        self.api_key = api_key
         self.error = error
 
 
@@ -219,7 +219,7 @@ class ApiKeyValidator:
             endpoint=f"{TEAMDESK_API_KEYS_TABLE}/select.json",
             params={
                 "filter": filter_query,
-                "column": ["Key", "Token", "Ativo", "Nome", "@Row ID"],
+                "column": ["Key", "Token", "Ativo", "Nome"],
             },
         )
 
@@ -268,7 +268,7 @@ class ApiKeyValidator:
             valid=True,
             token=user_token,
             user_name=record.get("Nome", ""),
-            record_id=record.get("@Row ID"),
+            api_key=api_key,
         )
 
         # Cachear resultado
@@ -277,19 +277,22 @@ class ApiKeyValidator:
 
         return result
 
-    async def update_last_use(self, record_id: int, http_client: "TeamDeskClient"):
+    async def update_last_use(self, api_key: str, http_client: "TeamDeskClient"):
         """Atualiza o campo Ultimo_Uso do registro da API Key."""
-        if not record_id or not TEAMDESK_MASTER_TOKEN:
+        if not api_key or not TEAMDESK_MASTER_TOKEN:
             return
 
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        await http_client.request(
-            method="PUT",
-            token=TEAMDESK_MASTER_TOKEN,
-            endpoint=f"{TEAMDESK_API_KEYS_TABLE}/{record_id}.json",
-            json_data={"Ultimo_Uso": now},
-            retries=1,  # Não retentar para não atrasar a resposta
-        )
+        try:
+            await http_client.request(
+                method="PUT",
+                token=TEAMDESK_MASTER_TOKEN,
+                endpoint=f"{TEAMDESK_API_KEYS_TABLE}/upsert.json",
+                json_data=[{"Key": api_key, "Ultimo_Uso": now}],
+                retries=1,
+            )
+        except Exception:
+            pass  # Não falhar se não conseguir atualizar
 
     async def cleanup(self):
         """Remove entradas expiradas do cache."""
@@ -948,7 +951,7 @@ async def tools_call_endpoint(request: Request) -> Response:
     # Atualizar Ultimo_Uso da API Key (em background, sem bloquear resposta)
     if validation.record_id:
         asyncio.create_task(
-            api_key_validator.update_last_use(validation.record_id, http_client)
+            api_key_validator.update_last_use(validation.api_key, http_client)
         )
 
     return JSONResponse(
