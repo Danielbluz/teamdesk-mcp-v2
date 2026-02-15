@@ -1,0 +1,7 @@
+# TeamDesk MCP Server - SSE Remote Dependencies
+mcp>=1.0.0
+httpx>=0.25.0
+starlette>=0.32.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0

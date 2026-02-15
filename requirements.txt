@@ -1,0 +1,14 @@
+# TeamDesk MCP Server - Dependencies
+
+# Core (stdio mode)
+mcp>=1.0.0
+python-dotenv>=1.0.0
+
+# SSE mode (deploy/server_sse.py) additionally requires:
+# httpx>=0.25.0
+# starlette>=0.32.0
+# uvicorn>=0.24.0
+# pydantic>=2.0.0
+
+# Testing
+# pytest>=7.0.0

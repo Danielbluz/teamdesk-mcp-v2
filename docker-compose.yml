@@ -1,0 +1,14 @@
+# Docker Compose for the SSE remote server.
+# For the stdio local server, use install.bat/install.sh instead.
+# See deploy/ folder for the full SSE deployment setup.
+
+services:
+  teamdesk-mcp:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    container_name: teamdesk-mcp
+    restart: unless-stopped
+    env_file: deploy/.env
+    ports:
+      - "${MCP_PORT:-8080}:8080"

@@ -1,0 +1,25 @@
+services:
+  teamdesk-mcp:
+    image: python:3.11-slim
+    container_name: teamdesk-mcp
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./server_sse.py:/app/server_sse.py:ro
+    command: >
+      bash -c "
+        pip install -q httpx mcp python-dotenv starlette uvicorn pydantic &&
+        python -m uvicorn server_sse:app --host 0.0.0.0 --port 8080
+      "
+    environment:
+      - TEAMDESK_DATABASE_ID=${TEAMDESK_DATABASE_ID}
+      - TEAMDESK_MASTER_TOKEN=${TEAMDESK_MASTER_TOKEN}
+      - TEAMDESK_API_KEYS_TABLE=${TEAMDESK_API_KEYS_TABLE:-API-Keys}
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8080
+      - MCP_RATE_LIMIT=${MCP_RATE_LIMIT:-100}
+      - MCP_CACHE_TTL=${MCP_CACHE_TTL:-300}
+      - MCP_API_KEY_CACHE_TTL=${MCP_API_KEY_CACHE_TTL:-60}
+      - MCP_CORS_ORIGINS=${MCP_CORS_ORIGINS:-}
+    ports:
+      - "8080:8080"
