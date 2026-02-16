@@ -49,7 +49,12 @@ load_dotenv()
 # Configuration
 TEAMDESK_DATABASE_ID = os.getenv("TEAMDESK_DATABASE_ID", "")
 TEAMDESK_MASTER_TOKEN = os.getenv("TEAMDESK_MASTER_TOKEN", "")
-TEAMDESK_API_KEYS_TABLE = os.getenv("TEAMDESK_API_KEYS_TABLE", "API-Keys")
+TEAMDESK_API_KEYS_TABLE = os.getenv("TEAMDESK_API_KEYS_TABLE", "Acesso")
+TEAMDESK_COL_KEY = os.getenv("TEAMDESK_COL_KEY", "Chave_MCP")
+TEAMDESK_COL_TOKEN = os.getenv("TEAMDESK_COL_TOKEN", "Token")
+TEAMDESK_COL_ACTIVE = os.getenv("TEAMDESK_COL_ACTIVE", "Ativo_MCP")
+TEAMDESK_COL_NAME = os.getenv("TEAMDESK_COL_NAME", "Nome")
+TEAMDESK_COL_LAST_USE = os.getenv("TEAMDESK_COL_LAST_USE", "Ultimo_Uso")
 MCP_RATE_LIMIT = int(os.getenv("MCP_RATE_LIMIT", "100"))
 MCP_CACHE_TTL = int(os.getenv("MCP_CACHE_TTL", "300"))
 MCP_API_KEY_CACHE_TTL = int(os.getenv("MCP_API_KEY_CACHE_TTL", "60"))
@@ -205,8 +210,8 @@ class ApiKeyValidator:
             token=TEAMDESK_MASTER_TOKEN,
             endpoint=f"{urllib.parse.quote(TEAMDESK_API_KEYS_TABLE, safe='')}/select.json",
             params={
-                "filter": f"[Key]='{safe_key}'",
-                "column": ["Key", "Token", "Ativo", "Nome", "@row.id"],
+                "filter": f"[{TEAMDESK_COL_KEY}]='{safe_key}'",
+                "column": [TEAMDESK_COL_KEY, TEAMDESK_COL_TOKEN, TEAMDESK_COL_ACTIVE, TEAMDESK_COL_NAME, "@row.id"],
             },
         )
 
@@ -223,18 +228,18 @@ class ApiKeyValidator:
             return result
 
         record = records[0]
-        ativo = record.get("Ativo", "")
+        ativo = record.get(TEAMDESK_COL_ACTIVE, "")
         if ativo not in ("Sim", "Yes", True, "true", "1", 1):
             result = ApiKeyValidationResult(valid=False, error="API key disabled")
             async with self._lock:
                 self.cache[api_key] = (result, time.time() + 10)
             return result
 
-        user_token = record.get("Token", "") or TEAMDESK_MASTER_TOKEN
+        user_token = record.get(TEAMDESK_COL_TOKEN, "") or TEAMDESK_MASTER_TOKEN
         result = ApiKeyValidationResult(
             valid=True,
             token=user_token,
-            user_name=record.get("Nome", ""),
+            user_name=record.get(TEAMDESK_COL_NAME, ""),
             api_key=api_key,
             record_id=record.get("@row.id"),
         )
@@ -252,7 +257,7 @@ class ApiKeyValidator:
                 method="POST",
                 token=TEAMDESK_MASTER_TOKEN,
                 endpoint=f"{table}/update.json",
-                json_data=[{"@row.id": record_id, "Ultimo_Uso": now}],
+                json_data=[{"@row.id": record_id, TEAMDESK_COL_LAST_USE: now}],
                 retries=1,
             )
         except Exception:
