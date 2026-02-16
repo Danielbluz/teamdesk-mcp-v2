@@ -169,12 +169,11 @@ class TTLCache:
 
 class ApiKeyValidationResult:
     def __init__(self, valid: bool, token: str = None, user_name: str = None,
-                 api_key: str = None, record_id: int = None, error: str = None):
+                 api_key: str = None, error: str = None):
         self.valid = valid
         self.token = token
         self.user_name = user_name
         self.api_key = api_key
-        self.record_id = record_id
         self.error = error
 
 
@@ -211,7 +210,7 @@ class ApiKeyValidator:
             endpoint=f"{urllib.parse.quote(TEAMDESK_API_KEYS_TABLE, safe='')}/select.json",
             params={
                 "filter": f"[{TEAMDESK_COL_KEY}]='{safe_key}'",
-                "column": [TEAMDESK_COL_KEY, TEAMDESK_COL_TOKEN, TEAMDESK_COL_ACTIVE, TEAMDESK_COL_NAME, "@row.id"],
+                "column": [TEAMDESK_COL_KEY, TEAMDESK_COL_TOKEN, TEAMDESK_COL_ACTIVE, TEAMDESK_COL_NAME],
             },
         )
 
@@ -241,23 +240,23 @@ class ApiKeyValidator:
             token=user_token,
             user_name=record.get(TEAMDESK_COL_NAME, ""),
             api_key=api_key,
-            record_id=record.get("@row.id"),
         )
         async with self._lock:
             self.cache[api_key] = (result, time.time() + self.cache_ttl)
         return result
 
-    async def update_last_use(self, record_id: int, http_client: "TeamDeskClient"):
-        if not record_id or not TEAMDESK_MASTER_TOKEN:
+    async def update_last_use(self, api_key: str, http_client: "TeamDeskClient"):
+        if not api_key or not TEAMDESK_MASTER_TOKEN:
             return
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         try:
             table = urllib.parse.quote(TEAMDESK_API_KEYS_TABLE, safe="")
+            match = urllib.parse.quote(TEAMDESK_COL_KEY, safe="")
             await http_client.request(
                 method="POST",
                 token=TEAMDESK_MASTER_TOKEN,
-                endpoint=f"{table}/update.json",
-                json_data=[{"@row.id": record_id, TEAMDESK_COL_LAST_USE: now}],
+                endpoint=f"{table}/upsert.json?match={match}",
+                json_data=[{TEAMDESK_COL_KEY: api_key, TEAMDESK_COL_LAST_USE: now}],
                 retries=1,
             )
         except Exception:
@@ -780,8 +779,8 @@ async def tools_call_endpoint(request: Request) -> Response:
         return JSONResponse({"error": result["result"]["error"]}, status_code=sc, headers=headers)
 
     # Update last use in background
-    if validation.record_id:
-        asyncio.create_task(api_key_validator.update_last_use(validation.record_id, http_client))
+    if validation.api_key:
+        asyncio.create_task(api_key_validator.update_last_use(validation.api_key, http_client))
 
     return JSONResponse({"result": result["result"]}, status_code=200, headers=headers)
 
