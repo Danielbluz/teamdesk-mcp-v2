@@ -12,6 +12,10 @@ services:
         python -m uvicorn server_sse:app --host 0.0.0.0 --port 8080
       "
     environment:
+      - LANG=C.UTF-8
+      - LC_ALL=C.UTF-8
+      - PYTHONIOENCODING=utf-8
+      - PYTHONUNBUFFERED=1
       - TEAMDESK_DATABASE_ID=${TEAMDESK_DATABASE_ID}
       - TEAMDESK_MASTER_TOKEN=${TEAMDESK_MASTER_TOKEN}
       - TEAMDESK_API_KEYS_TABLE=${TEAMDESK_API_KEYS_TABLE:-API-Keys}

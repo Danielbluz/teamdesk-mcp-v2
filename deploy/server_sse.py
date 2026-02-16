@@ -10,16 +10,27 @@ Usage:
 """
 
 import os
+import sys
 import json
 import time
 import asyncio
 import hashlib
+import logging
 import re
 import urllib.parse
 from typing import Any, Optional
 from collections import defaultdict
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+
+# Force UTF-8 for stdout/stderr
+if sys.stdout.encoding != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+if sys.stderr.encoding != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("teamdesk-mcp")
 
 import httpx
 from dotenv import load_dotenv
@@ -488,6 +499,7 @@ TOOLS = [
 CACHEABLE_OPERATIONS = {"list_tables", "describe_table"}
 
 
+
 # ============================================================================
 # TOOL EXECUTION
 # ============================================================================
@@ -525,6 +537,10 @@ async def execute_tool(token: str, name: str, args: dict) -> dict:
 
 async def _run_tool(token: str, name: str, args: dict) -> dict:
     """Execute tool with corrected TeamDesk API endpoints."""
+    logger.info(f"Tool: {name} | Args: {json.dumps(args, ensure_ascii=False)}")
+    if args.get("table"):
+        raw = args["table"]
+        logger.info(f"Raw table name: {repr(raw)} | bytes: {raw.encode('utf-8').hex()}")
 
     if name == "list_tables":
         # CORRECT: describe.json (NOT tables.json)
@@ -656,8 +672,25 @@ async def health_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "healthy",
         "service": "teamdesk-mcp-server",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+async def test_encoding_endpoint(request: Request) -> JSONResponse:
+    """Diagnostic endpoint to verify UTF-8 encoding through the entire stack."""
+    text = request.query_params.get("text", "Geração Irradiação Mês ºC")
+    return JSONResponse({
+        "received": text,
+        "repr": repr(text),
+        "bytes_hex": text.encode("utf-8").hex(),
+        "url_encoded": urllib.parse.quote(text, safe=""),
+        "round_trip": urllib.parse.unquote(urllib.parse.quote(text, safe="")),
+        "match": text == urllib.parse.unquote(urllib.parse.quote(text, safe="")),
+        "sys_encoding": sys.getdefaultencoding(),
+        "stdout_encoding": sys.stdout.encoding,
+        "lang": os.environ.get("LANG", "NOT SET"),
+        "lc_all": os.environ.get("LC_ALL", "NOT SET"),
     })
 
 
@@ -779,10 +812,14 @@ async def cleanup_task():
 async def lifespan(app):
     await http_client.start()
     task = asyncio.create_task(cleanup_task())
-    print(f"TeamDesk MCP Server v2.1 (SSE)")
-    print(f"Host: {MCP_HOST}:{MCP_PORT}")
-    print(f"Database: {'configured' if TEAMDESK_DATABASE_ID else 'NOT SET'}")
-    print(f"Master Token: {'configured' if TEAMDESK_MASTER_TOKEN else 'NOT SET'}")
+    logger.info(f"TeamDesk MCP Server v2.2 (SSE)")
+    logger.info(f"Host: {MCP_HOST}:{MCP_PORT}")
+    logger.info(f"Database: {'configured' if TEAMDESK_DATABASE_ID else 'NOT SET'}")
+    logger.info(f"Master Token: {'configured' if TEAMDESK_MASTER_TOKEN else 'NOT SET'}")
+    logger.info(f"Locale: LANG={os.environ.get('LANG', 'NOT SET')}, "
+                f"LC_ALL={os.environ.get('LC_ALL', 'NOT SET')}, "
+                f"stdout={sys.stdout.encoding}, default={sys.getdefaultencoding()}")
+    logger.info(f"UTF-8 test: Geração Irradiação Mês ºC")
     yield
     task.cancel()
     await http_client.stop()
@@ -793,6 +830,7 @@ cors_origins = [o.strip() for o in MCP_CORS_ORIGINS if o.strip()]
 
 routes = [
     Route("/health", health_endpoint, methods=["GET"]),
+    Route("/test-encoding", test_encoding_endpoint, methods=["GET"]),
     Route("/tools", tools_list_endpoint, methods=["GET"]),
     Route("/tools/call", tools_call_endpoint, methods=["POST"]),
     Route("/sse", sse_endpoint, methods=["GET"]),
