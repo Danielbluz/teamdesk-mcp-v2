@@ -21,17 +21,19 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv()
 
 # Configuration from environment
-TEAMDESK_TOKEN = os.getenv("TEAMDESK_TOKEN", "")
+# Accept both TEAMDESK_API_TOKEN (installer) and TEAMDESK_TOKEN (legacy)
+TEAMDESK_TOKEN = os.getenv("TEAMDESK_API_TOKEN") or os.getenv("TEAMDESK_TOKEN", "")
 TEAMDESK_DATABASE_ID = os.getenv("TEAMDESK_DATABASE_ID", "")
 TEAMDESK_BASE_URL = "https://www.teamdesk.net/secure/api/v2"
 
 if not TEAMDESK_TOKEN or not TEAMDESK_DATABASE_ID:
     import sys
     print(
-        "WARNING: TEAMDESK_TOKEN and TEAMDESK_DATABASE_ID must be set.\n"
-        "Copy .env.example to .env and fill in your credentials.",
+        "ERROR: TEAMDESK_API_TOKEN and TEAMDESK_DATABASE_ID must be set.\n"
+        "Run the installer or set environment variables manually.",
         file=sys.stderr,
     )
+    sys.exit(1)
 
 # Initialize MCP server
 mcp = FastMCP("TeamDesk MCP")

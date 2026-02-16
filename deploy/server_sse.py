@@ -672,11 +672,29 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
 # ============================================================================
 
 
+async def setup_endpoint(request: Request) -> JSONResponse:
+    """Validates API key and returns token for local MCP configuration."""
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        return JSONResponse({"error": "X-API-Key header required"}, status_code=401)
+
+    validation = await api_key_validator.validate(api_key, http_client)
+    if not validation.valid:
+        return JSONResponse({"error": validation.error}, status_code=401)
+
+    return JSONResponse({
+        "valid": True,
+        "name": validation.user_name,
+        "token": validation.token,
+        "database_id": TEAMDESK_DATABASE_ID,
+    })
+
+
 async def health_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "healthy",
         "service": "teamdesk-mcp-server",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -816,7 +834,7 @@ async def cleanup_task():
 async def lifespan(app):
     await http_client.start()
     task = asyncio.create_task(cleanup_task())
-    logger.info(f"TeamDesk MCP Server v2.2 (SSE)")
+    logger.info(f"TeamDesk MCP Server v2.3 (SSE)")
     logger.info(f"Host: {MCP_HOST}:{MCP_PORT}")
     logger.info(f"Database: {'configured' if TEAMDESK_DATABASE_ID else 'NOT SET'}")
     logger.info(f"Master Token: {'configured' if TEAMDESK_MASTER_TOKEN else 'NOT SET'}")
@@ -834,6 +852,7 @@ cors_origins = [o.strip() for o in MCP_CORS_ORIGINS if o.strip()]
 
 routes = [
     Route("/health", health_endpoint, methods=["GET"]),
+    Route("/setup", setup_endpoint, methods=["GET"]),
     Route("/test-encoding", test_encoding_endpoint, methods=["GET"]),
     Route("/tools", tools_list_endpoint, methods=["GET"]),
     Route("/tools/call", tools_call_endpoint, methods=["POST"]),
