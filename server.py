@@ -9,6 +9,8 @@ Usage:
 
 import json
 import os
+import sys
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -27,7 +29,6 @@ TEAMDESK_DATABASE_ID = os.getenv("TEAMDESK_DATABASE_ID", "")
 TEAMDESK_BASE_URL = "https://www.teamdesk.net/secure/api/v2"
 
 if not TEAMDESK_TOKEN or not TEAMDESK_DATABASE_ID:
-    import sys
     print(
         "ERROR: TEAMDESK_API_TOKEN and TEAMDESK_DATABASE_ID must be set.\n"
         "Run the installer or set environment variables manually.",
@@ -49,8 +50,15 @@ def sanitize_search_text(text: str) -> str:
     return text.replace("'", "''")
 
 
-def make_request(endpoint: str, method: str = "GET", data: Any = None) -> dict:
-    """Make a request to the TeamDesk API."""
+def _log(msg: str) -> None:
+    """Log to stderr (visible in Claude Desktop dev tools, never sent to client)."""
+    print(f"[TeamDesk MCP] {msg}", file=sys.stderr, flush=True)
+
+
+def make_request(
+    endpoint: str, method: str = "GET", data: Any = None, max_retries: int = 2
+) -> dict:
+    """Make a request to the TeamDesk API with retry and logging."""
     url = (
         f"{TEAMDESK_BASE_URL}"
         f"/{TEAMDESK_DATABASE_ID}"
@@ -66,18 +74,37 @@ def make_request(endpoint: str, method: str = "GET", data: Any = None) -> dict:
     if data is not None:
         req_data = json.dumps(data).encode("utf-8")
 
-    request = urllib.request.Request(
-        url, data=req_data, headers=headers, method=method
-    )
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        request = urllib.request.Request(
+            url, data=req_data, headers=headers, method=method
+        )
+        t0 = time.time()
+        try:
+            with urllib.request.urlopen(request, timeout=55) as response:
+                body = response.read().decode("utf-8")
+                elapsed = time.time() - t0
+                _log(f"{method} {endpoint} → {response.status} ({elapsed:.1f}s)")
+                return json.loads(body)
+        except urllib.error.HTTPError as e:
+            elapsed = time.time() - t0
+            error_body = e.read().decode("utf-8") if e.fp else str(e)
+            _log(f"{method} {endpoint} → HTTP {e.code} ({elapsed:.1f}s) attempt {attempt}/{max_retries}")
+            last_error = f"HTTP {e.code}: {error_body}"
+            # Don't retry client errors (4xx) — only server/timeout errors
+            if 400 <= e.code < 500:
+                return {"error": last_error}
+        except Exception as e:
+            elapsed = time.time() - t0
+            _log(f"{method} {endpoint} → {type(e).__name__}: {e} ({elapsed:.1f}s) attempt {attempt}/{max_retries}")
+            last_error = str(e)
 
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8") if e.fp else str(e)
-        return {"error": f"HTTP {e.code}: {error_body}"}
-    except Exception as e:
-        return {"error": str(e)}
+        if attempt < max_retries:
+            wait = 3 * attempt  # 3s, 6s
+            _log(f"Retrying in {wait}s...")
+            time.sleep(wait)
+
+    return {"error": f"Falha após {max_retries} tentativas: {last_error}"}
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +317,11 @@ def delete_record(table_name: str, record_id: int) -> str:
 
 @mcp.tool()
 def search_records(
-    table_name: str, search_text: str, columns: str = None, top: int = 50
+    table_name: str,
+    search_text: str,
+    search_columns: str = None,
+    columns: str = None,
+    top: int = 50,
 ) -> str:
     """
     Search records containing the specified text.
@@ -298,13 +329,39 @@ def search_records(
     Args:
         table_name: Table name
         search_text: Text to search for
-        columns: Columns to return, comma-separated (optional)
+        search_columns: Columns to search IN, comma-separated (optional).
+            If omitted, auto-detects text columns via describe.json.
+        columns: Columns to return in the result, comma-separated (optional)
         top: Maximum results (default: 50)
     """
     encoded = _sanitize_table_name(table_name)
     safe_text = sanitize_search_text(search_text)
 
-    filter_expr = f"Contains([*], '{safe_text}')"
+    # Determine which columns to search in
+    if search_columns:
+        cols_to_search = [c.strip() for c in search_columns.split(",")]
+    else:
+        # Auto-detect text-like columns from table schema
+        schema = make_request(f"{encoded}/describe.json")
+        if "error" in schema:
+            return f"Error getting table schema: {schema['error']}"
+        text_types = {"Text", "Memo", "Email", "Phone", "URL", "Autonumber"}
+        cols_to_search = [
+            col["name"]
+            for col in schema.get("columns", [])
+            if col.get("type") in text_types
+        ]
+        if not cols_to_search:
+            return "Error: No text columns found in table to search"
+
+    # Build Or(Contains(...), Contains(...), ...) filter
+    contains_parts = [
+        f"Contains([{col}], '{safe_text}')" for col in cols_to_search
+    ]
+    if len(contains_parts) == 1:
+        filter_expr = contains_parts[0]
+    else:
+        filter_expr = f"Or({', '.join(contains_parts)})"
 
     params = {"top": min(top, 500), "filter": filter_expr}
     if columns:
