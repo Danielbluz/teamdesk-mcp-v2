@@ -14,10 +14,14 @@ import sys
 import json
 import time
 import asyncio
+import base64
+import contextvars
 import hashlib
 import logging
 import re
+import secrets
 import urllib.parse
+import uuid
 from typing import Any, Optional
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -36,6 +40,7 @@ import httpx
 from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import Tool, TextContent
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -45,6 +50,10 @@ from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 
 load_dotenv()
+
+# Context variables for mobile SSE auth (token injected in endpoint, read in handle_call_tool)
+current_user_token: contextvars.ContextVar[str] = contextvars.ContextVar("current_user_token")
+current_user_key: contextvars.ContextVar[str] = contextvars.ContextVar("current_user_key")
 
 # Configuration
 TEAMDESK_DATABASE_ID = os.getenv("TEAMDESK_DATABASE_ID", "")
@@ -62,21 +71,17 @@ MCP_CORS_ORIGINS = os.getenv("MCP_CORS_ORIGINS", "").split(",")
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8080"))
 MCP_MAX_PAYLOAD_SIZE = int(os.getenv("MCP_MAX_PAYLOAD_SIZE", "1048576"))
+MCP_PUBLIC_URL = os.getenv("MCP_PUBLIC_URL", "https://mcp.forgreen.com.br")
 
 TEAMDESK_API_BASE = "https://www.teamdesk.net/secure/api/v2"
 
 # API key validation regex: alphanumeric, underscores, hyphens, dots (8-128 chars)
-_API_KEY_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]{8,128}$")
+_API_KEY_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.\*]{8,128}$")
 
 
 def validate_api_key_format(api_key: str) -> bool:
     """Validate API key contains only safe characters and is 8-128 chars."""
     return bool(_API_KEY_PATTERN.match(api_key))
-
-
-def sanitize_search_text(text: str) -> str:
-    """Escape single quotes in search text to prevent filter injection."""
-    return text.replace("'", "''")
 
 
 # ============================================================================
@@ -473,12 +478,13 @@ TOOLS = [
     ),
     Tool(
         name="search_records",
-        description="Full-text search across all columns of a table",
+        description="Search records containing text. Auto-detects text columns if search_columns not provided.",
         inputSchema={
             "type": "object",
             "properties": {
                 "table": {"type": "string", "description": "Table name"},
                 "search_text": {"type": "string", "description": "Text to search for"},
+                "search_columns": {"type": "array", "items": {"type": "string"}, "description": "Columns to search IN (optional, auto-detects text columns if omitted)"},
                 "columns": {"type": "array", "items": {"type": "string"}, "description": "Columns to return"},
                 "top": {"type": "integer", "description": "Max results (default: 50)"},
             },
@@ -502,6 +508,9 @@ TOOLS = [
 
 CACHEABLE_OPERATIONS = {"list_tables", "describe_table"}
 
+# Module-level SSE transport for original /sse endpoint (Claude Code / mcp-remote clients)
+_sse_transport = SseServerTransport("/messages")
+
 
 
 # ============================================================================
@@ -512,7 +521,23 @@ rate_limiter = RateLimiter(max_requests=MCP_RATE_LIMIT)
 cache = TTLCache(default_ttl=MCP_CACHE_TTL)
 http_client = TeamDeskClient()
 api_key_validator = ApiKeyValidator(cache_ttl=MCP_API_KEY_CACHE_TTL)
-mcp_server = Server("teamdesk-mcp-server")
+mcp_server = Server(
+    "teamdesk-mcp-server",
+    instructions="""Você é um assistente da ForGreen Energia Solar. Responda SEMPRE em português brasileiro.
+
+FORMATAÇÃO (o usuário pode estar no celular):
+- NUNCA use tabelas markdown. Use listas compactas com bullet points.
+- Máximo 3-5 campos por registro. Priorize os mais relevantes.
+- Para múltiplos registros, mostre um resumo (ex: "12 usinas encontradas") e liste os principais.
+- Números grandes: use formato brasileiro (1.234,56) e abrevie (1,2 MW ao invés de 1200 kW).
+- Datas: formato DD/MM/YYYY.
+
+CONTEXTO:
+- Database TeamDesk da ForGreen (energia solar, usinas fotovoltaicas, inversores, faturamento).
+- Tabelas principais: Usina Solar, Inversor, Geração Mensal, Geracao_Dia, Cliente, Faturamento.
+- Coluna de filtro por usina: [Instalação] (código numérico) ou [Nome da Usina].
+""",
+)
 
 
 @mcp_server.list_tools()
@@ -522,7 +547,22 @@ async def handle_list_tools() -> list[Tool]:
 
 @mcp_server.call_tool()
 async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
-    return [TextContent(type="text", text=json.dumps({"error": "Use the HTTP endpoint"}))]
+    token = current_user_token.get(None)
+    if not token:
+        return [TextContent(type="text", text=json.dumps({"error": "Authentication required"}))]
+
+    user_key = current_user_key.get("unknown")
+    allowed, remaining = await rate_limiter.is_allowed(user_key)
+    if not allowed:
+        return [TextContent(type="text", text=json.dumps({"error": "Rate limit exceeded"}))]
+
+    result = await execute_tool(token, name, arguments)
+    asyncio.create_task(api_key_validator.update_last_use(user_key, http_client))
+
+    return [TextContent(
+        type="text",
+        text=json.dumps(result.get("result", result), indent=2, ensure_ascii=False),
+    )]
 
 
 async def execute_tool(token: str, name: str, args: dict) -> dict:
@@ -641,8 +681,30 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
             return {"error": err}
         table = sanitize_table_name(args["table"])
         safe_text = sanitize_search_text(args["search_text"])
+
+        # Determine which columns to search in
+        search_cols = args.get("search_columns")
+        if search_cols:
+            cols_to_search = search_cols if isinstance(search_cols, list) else [search_cols]
+        else:
+            # Auto-detect text columns via describe.json
+            schema = await http_client.request("GET", token, f"{table}/describe.json")
+            if "error" in schema:
+                return {"error": f"Cannot get schema: {schema['error']}"}
+            text_types = {"Text", "Memo", "Email", "Phone", "URL", "Autonumber"}
+            cols_to_search = [
+                col["name"] for col in schema.get("columns", [])
+                if col.get("type") in text_types
+            ]
+            if not cols_to_search:
+                return {"error": "No text columns found in table to search"}
+
+        # Build Or(Contains(...), ...) filter
+        parts = [f"Contains([{c}], '{safe_text}')" for c in cols_to_search]
+        filter_expr = parts[0] if len(parts) == 1 else f"Or({', '.join(parts)})"
+
         params = {
-            "filter": f"Contains([*], '{safe_text}')",
+            "filter": filter_expr,
             "top": min(args.get("top", 50), 500),
         }
         if args.get("columns"):
@@ -694,7 +756,7 @@ async def health_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "healthy",
         "service": "teamdesk-mcp-server",
-        "version": "2.3.0",
+        "version": "3.1.1",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -803,18 +865,246 @@ async def tools_call_endpoint(request: Request) -> Response:
     return JSONResponse({"result": result["result"]}, status_code=200, headers=headers)
 
 
-async def sse_endpoint(request: Request):
-    api_key = request.headers.get("X-API-Key")
-    if not api_key:
-        return JSONResponse({"error": "API key required (header X-API-Key)"}, status_code=401)
+class _SseHandler:
+    """ASGI handler for /sse - original SSE endpoint for Claude Code / mcp-remote."""
 
-    validation = await api_key_validator.validate(api_key, http_client)
-    if not validation.valid:
-        return JSONResponse({"error": validation.error}, status_code=401)
+    async def __call__(self, scope, receive, send):
+        request = Request(scope, receive, send)
+        api_key = request.headers.get("X-API-Key")
+        if not api_key:
+            response = JSONResponse({"error": "API key required (header X-API-Key)"}, status_code=401)
+            await response(scope, receive, send)
+            return
 
-    sse = SseServerTransport("/messages")
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-        await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
+        validation = await api_key_validator.validate(api_key, http_client)
+        if not validation.valid:
+            response = JSONResponse({"error": validation.error}, status_code=401)
+            await response(scope, receive, send)
+            return
+
+        logger.info(f"SSE connect: {validation.user_name} ({api_key[:12]}...)")
+        current_user_token.set(validation.token)
+        current_user_key.set(api_key)
+        asyncio.create_task(api_key_validator.update_last_use(api_key, http_client))
+
+        async with _sse_transport.connect_sse(scope, receive, send) as streams:
+            await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
+
+
+# ============================================================================
+# MOBILE STREAMABLE HTTP ENDPOINTS (Claude.ai / Claude mobile app)
+# Uses the newer Streamable HTTP protocol instead of SSE.
+# ============================================================================
+
+# Session manager for mobile endpoints (stateful - maintains session across requests)
+mobile_session_manager = StreamableHTTPSessionManager(
+    app=mcp_server,
+    json_response=False,
+    stateless=False,
+)
+
+
+class _MobileStreamableHandler:
+    """ASGI handler for /m/{chave}/sse - Streamable HTTP protocol for claude.ai."""
+
+    async def __call__(self, scope, receive, send):
+        chave = scope.get("path_params", {}).get("chave", "")
+        if not chave or not validate_api_key_format(chave):
+            response = Response(status_code=404)
+            await response(scope, receive, send)
+            return
+
+        validation = await api_key_validator.validate(chave, http_client)
+        if not validation.valid:
+            response = Response(status_code=404)
+            await response(scope, receive, send)
+            return
+
+        logger.info(f"Mobile connect: {validation.user_name} ({chave[:12]}...)")
+        current_user_token.set(validation.token)
+        current_user_key.set(chave)
+        asyncio.create_task(api_key_validator.update_last_use(chave, http_client))
+
+        # Ensure Accept header includes required values for Streamable HTTP
+        # (claude.ai may not send them on initial request, causing 406)
+        headers = list(scope.get("headers", []))
+        has_accept = False
+        for i, (name, value) in enumerate(headers):
+            if name == b"accept":
+                has_accept = True
+                val = value.decode("latin-1")
+                if "text/event-stream" not in val or "application/json" not in val:
+                    headers[i] = (b"accept", b"application/json, text/event-stream")
+                break
+        if not has_accept:
+            headers.append((b"accept", b"application/json, text/event-stream"))
+        scope["headers"] = headers
+
+        await mobile_session_manager.handle_request(scope, receive, send)
+
+
+# ============================================================================
+# ASGI HANDLERS for SSE message endpoints (Claude Code / mcp-remote)
+# ============================================================================
+
+
+class _MessagesHandler:
+    """ASGI handler for /messages - routes POST to original SSE transport."""
+
+    async def __call__(self, scope, receive, send):
+        await _sse_transport.handle_post_message(scope, receive, send)
+
+
+# ============================================================================
+# OAUTH 2.0 ENDPOINTS (Required by claude.ai custom connectors)
+# Implements RFC 9728, RFC 8414, RFC 7591, and PKCE (RFC 7636)
+# ============================================================================
+
+# In-memory stores (ephemeral - cleared on container restart)
+_oauth_clients: dict[str, dict] = {}   # client_id -> registration data
+_oauth_codes: dict[str, dict] = {}     # code -> {client_id, code_challenge, ...}
+_oauth_tokens: dict[str, dict] = {}    # access_token -> {client_id, expires_at}
+
+
+async def oauth_protected_resource(request: Request) -> JSONResponse:
+    """RFC 9728 - OAuth Protected Resource Metadata."""
+    return JSONResponse({
+        "resource": MCP_PUBLIC_URL,
+        "authorization_servers": [MCP_PUBLIC_URL],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": [],
+    })
+
+
+async def oauth_authorization_server(request: Request) -> JSONResponse:
+    """RFC 8414 - OAuth Authorization Server Metadata."""
+    return JSONResponse({
+        "issuer": MCP_PUBLIC_URL,
+        "authorization_endpoint": f"{MCP_PUBLIC_URL}/authorize",
+        "token_endpoint": f"{MCP_PUBLIC_URL}/token",
+        "registration_endpoint": f"{MCP_PUBLIC_URL}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": [],
+    })
+
+
+async def oauth_register(request: Request) -> JSONResponse:
+    """RFC 7591 - Dynamic Client Registration."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    client_id = str(uuid.uuid4())
+    _oauth_clients[client_id] = {
+        "client_id": client_id,
+        "redirect_uris": body.get("redirect_uris", []),
+        "client_name": body.get("client_name", "unknown"),
+        "created_at": time.time(),
+    }
+
+    # Cleanup old registrations (keep last 100)
+    if len(_oauth_clients) > 100:
+        oldest = sorted(_oauth_clients, key=lambda k: _oauth_clients[k]["created_at"])
+        for k in oldest[:len(_oauth_clients) - 100]:
+            del _oauth_clients[k]
+
+    logger.info(f"OAuth register: {body.get('client_name', 'unknown')} -> {client_id[:8]}...")
+    return JSONResponse({
+        "client_id": client_id,
+        "client_name": body.get("client_name", "unknown"),
+        "redirect_uris": body.get("redirect_uris", []),
+        "token_endpoint_auth_method": "none",
+    }, status_code=201)
+
+
+async def oauth_authorize(request: Request) -> Response:
+    """OAuth 2.0 Authorization Endpoint - auto-approves for MCP."""
+    client_id = request.query_params.get("client_id", "")
+    redirect_uri = request.query_params.get("redirect_uri", "")
+    state = request.query_params.get("state", "")
+    code_challenge = request.query_params.get("code_challenge", "")
+    code_challenge_method = request.query_params.get("code_challenge_method", "S256")
+
+    if not client_id or not redirect_uri:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    # Generate authorization code
+    code = secrets.token_urlsafe(32)
+    _oauth_codes[code] = {
+        "client_id": client_id,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "redirect_uri": redirect_uri,
+        "expires_at": time.time() + 300,
+    }
+
+    # Cleanup expired codes
+    now = time.time()
+    expired = [k for k, v in _oauth_codes.items() if now > v["expires_at"]]
+    for k in expired:
+        del _oauth_codes[k]
+
+    # Auto-redirect back with code (no user approval UI needed)
+    params = {"code": code}
+    if state:
+        params["state"] = state
+
+    sep = "&" if "?" in redirect_uri else "?"
+    redirect_url = redirect_uri + sep + urllib.parse.urlencode(params)
+    logger.info(f"OAuth authorize: client={client_id[:8]}... -> code issued")
+    return Response(status_code=302, headers={"Location": redirect_url})
+
+
+async def oauth_token(request: Request) -> JSONResponse:
+    """OAuth 2.0 Token Endpoint with PKCE S256 verification."""
+    try:
+        body = await request.body()
+        params = urllib.parse.parse_qs(body.decode("utf-8"))
+    except Exception:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    grant_type = params.get("grant_type", [""])[0]
+    code = params.get("code", [""])[0]
+    code_verifier = params.get("code_verifier", [""])[0]
+
+    if grant_type != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    code_data = _oauth_codes.pop(code, None)
+    if not code_data or time.time() > code_data["expires_at"]:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+    # Verify PKCE S256
+    if code_data["code_challenge"] and code_verifier:
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        if expected != code_data["code_challenge"]:
+            logger.warning(f"OAuth token: PKCE verification failed")
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+    # Issue access token
+    access_token = secrets.token_urlsafe(48)
+    _oauth_tokens[access_token] = {
+        "client_id": code_data["client_id"],
+        "expires_at": time.time() + 86400,
+    }
+
+    # Cleanup expired tokens
+    now = time.time()
+    expired = [k for k, v in _oauth_tokens.items() if now > v["expires_at"]]
+    for k in expired:
+        del _oauth_tokens[k]
+
+    logger.info(f"OAuth token: issued for client={code_data['client_id'][:8]}...")
+    return JSONResponse({
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": 86400,
+    })
 
 
 # ============================================================================
@@ -833,30 +1123,44 @@ async def cleanup_task():
 @asynccontextmanager
 async def lifespan(app):
     await http_client.start()
-    task = asyncio.create_task(cleanup_task())
-    logger.info(f"TeamDesk MCP Server v2.3 (SSE)")
-    logger.info(f"Host: {MCP_HOST}:{MCP_PORT}")
-    logger.info(f"Database: {'configured' if TEAMDESK_DATABASE_ID else 'NOT SET'}")
-    logger.info(f"Master Token: {'configured' if TEAMDESK_MASTER_TOKEN else 'NOT SET'}")
-    logger.info(f"Locale: LANG={os.environ.get('LANG', 'NOT SET')}, "
-                f"LC_ALL={os.environ.get('LC_ALL', 'NOT SET')}, "
-                f"stdout={sys.stdout.encoding}, default={sys.getdefaultencoding()}")
-    logger.info(f"UTF-8 test: Geração Irradiação Mês ºC")
-    yield
-    task.cancel()
+    async with mobile_session_manager.run():
+        task = asyncio.create_task(cleanup_task())
+        logger.info(f"TeamDesk MCP Server v3.2.0 (SSE + Streamable HTTP)")
+        logger.info(f"Host: {MCP_HOST}:{MCP_PORT}")
+        logger.info(f"Database: {'configured' if TEAMDESK_DATABASE_ID else 'NOT SET'}")
+        logger.info(f"Master Token: {'configured' if TEAMDESK_MASTER_TOKEN else 'NOT SET'}")
+        logger.info(f"Locale: LANG={os.environ.get('LANG', 'NOT SET')}, "
+                    f"LC_ALL={os.environ.get('LC_ALL', 'NOT SET')}, "
+                    f"stdout={sys.stdout.encoding}, default={sys.getdefaultencoding()}")
+        logger.info(f"UTF-8 test: Geração Irradiação Mês ºC")
+        yield
+        task.cancel()
     await http_client.stop()
 
 
 # Restrictive CORS: no wildcard by default
 cors_origins = [o.strip() for o in MCP_CORS_ORIGINS if o.strip()]
+# Always allow Claude.ai for mobile MCP connector
+if "https://claude.ai" not in cors_origins:
+    cors_origins.append("https://claude.ai")
 
 routes = [
+    # OAuth 2.0 endpoints (required by claude.ai custom connectors)
+    Route("/.well-known/oauth-protected-resource/{path:path}", oauth_protected_resource, methods=["GET"]),
+    Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]),
+    Route("/.well-known/oauth-authorization-server", oauth_authorization_server, methods=["GET"]),
+    Route("/register", oauth_register, methods=["POST"]),
+    Route("/authorize", oauth_authorize, methods=["GET"]),
+    Route("/token", oauth_token, methods=["POST"]),
+    # Existing endpoints
     Route("/health", health_endpoint, methods=["GET"]),
     Route("/setup", setup_endpoint, methods=["GET"]),
     Route("/test-encoding", test_encoding_endpoint, methods=["GET"]),
     Route("/tools", tools_list_endpoint, methods=["GET"]),
     Route("/tools/call", tools_call_endpoint, methods=["POST"]),
-    Route("/sse", sse_endpoint, methods=["GET"]),
+    Route("/sse", _SseHandler()),
+    Route("/messages", _MessagesHandler()),
+    Route("/m/{chave}/sse", _MobileStreamableHandler()),
 ]
 
 middleware = [
@@ -865,7 +1169,7 @@ middleware = [
         allow_origins=cors_origins or ["*"],
         allow_credentials=True,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-API-Key"],
+        allow_headers=["Content-Type", "X-API-Key", "Authorization"],
         expose_headers=["X-Cache", "X-RateLimit-Limit", "X-RateLimit-Remaining"],
     ),
 ]
