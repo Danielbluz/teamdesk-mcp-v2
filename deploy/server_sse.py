@@ -1284,12 +1284,16 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
             if "error" not in schema_res:
                 _schema_cache[resolved_table] = schema_res
         schema = _schema_cache.get(resolved_table)
-        key_col = "@row.id"
+        key_col = None
         if schema:
             for col in schema.get("columns", []):
                 if col.get("isKey"):
                     key_col = col["name"]
                     break
+            if not key_col and schema.get("columns"):
+                key_col = schema["columns"][0]["name"]
+        if not key_col:
+            return {"error": "Could not determine a column for COUNT"}
 
         params = {"column": [f"{key_col}//COUNT"], "top": 1}
         if args.get("filter"):

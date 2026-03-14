@@ -940,8 +940,10 @@ def count_records(table_name: str, filter_expr: str = None) -> str:
             if col.get("isKey"):
                 key_col = col["name"]
                 break
+    if not key_col and schema and schema.get("columns"):
+        key_col = schema["columns"][0]["name"]
     if not key_col:
-        key_col = "@row.id"
+        return json.dumps({"error": "Could not determine a column for COUNT"})
 
     params = {"column": [f"{key_col}//COUNT"], "top": 1}
     if filter_expr:
