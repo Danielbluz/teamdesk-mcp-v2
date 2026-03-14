@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server_sse.py .
+COPY td_query_checker.py .
 COPY .env .env
 
 EXPOSE 8080

@@ -38,10 +38,11 @@ logger = logging.getLogger("teamdesk-mcp")
 
 import httpx
 from dotenv import load_dotenv
+from td_query_checker import check_filter, check_columns, check_table_name, broaden_filter
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, Resource, Prompt, PromptArgument, PromptMessage, GetPromptResult
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.requests import Request
@@ -421,6 +422,7 @@ TOOLS = [
             "properties": {
                 "table": {"type": "string", "description": "Table name"},
                 "data": {"type": "object", "description": "Record data (field: value)"},
+                "suppress_triggers": {"type": "boolean", "description": "Suppress workflow triggers (default: false)"},
             },
             "required": ["table", "data"],
         },
@@ -434,6 +436,7 @@ TOOLS = [
                 "table": {"type": "string", "description": "Table name"},
                 "record_id": {"type": "integer", "description": "Record ID"},
                 "data": {"type": "object", "description": "Data to update (field: value)"},
+                "suppress_triggers": {"type": "boolean", "description": "Suppress workflow triggers (default: false)"},
             },
             "required": ["table", "record_id", "data"],
         },
@@ -459,6 +462,7 @@ TOOLS = [
                 "table": {"type": "string", "description": "Table name"},
                 "match_column": {"type": "string", "description": "Column for match (must be Unique)"},
                 "records": {"type": "array", "items": {"type": "object"}, "description": "Records to upsert"},
+                "suppress_triggers": {"type": "boolean", "description": "Suppress workflow triggers (default: false)"},
             },
             "required": ["table", "match_column", "records"],
         },
@@ -504,7 +508,148 @@ TOOLS = [
             "required": ["table", "column", "record_id"],
         },
     ),
+    Tool(
+        name="smart_query",
+        description="Query TeamDesk with automatic validation and correction of common mistakes. "
+                    "Fixes accent errors, date formats, LIKE→Contains, AND→and. Use instead of get_records for safer queries.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "Table name (e.g. 'Usina Solar', 'Geracao Mensal', 'CUSD')"},
+                "filter": {"type": "string", "description": "Filter expression (auto-corrected)"},
+                "columns": {"type": "array", "items": {"type": "string"}, "description": "Columns to return (auto-corrected)"},
+                "top": {"type": "integer", "description": "Max records (default: 100)"},
+                "skip": {"type": "integer", "description": "Records to skip"},
+                "sort": {"type": "string", "description": "Sort: 'Column' or 'Column//DESC'"},
+            },
+            "required": ["table"],
+        },
+    ),
+    Tool(
+        name="global_search",
+        description="Search for text across ALL TeamDesk tables. Returns results grouped by table. "
+                    "Use for finding records when you don't know which table contains the data.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "search_text": {"type": "string", "description": "Text to search for (e.g. 'Paracatu', '3014576923')"},
+                "tables": {"type": "array", "items": {"type": "string"}, "description": "Specific tables to search (optional, searches all if empty)"},
+                "top_per_table": {"type": "integer", "description": "Max results per table (default: 5)"},
+            },
+            "required": ["search_text"],
+        },
+    ),
+    Tool(
+        name="aggregate_query",
+        description="Run aggregation queries (SUM, AVG, COUNT, MIN, MAX) directly on TeamDesk. "
+                    "Much more efficient than fetching all records. Supports grouping by date (MM, YY, DD, QQ) or value (EQ).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "Table name"},
+                "measure_column": {"type": "string", "description": "Column to aggregate (e.g. 'Geracao dia (kWh)')"},
+                "measure_function": {"type": "string", "description": "SUM, COUNT, AVG, MIN, MAX, STDEV, VAR (default: SUM)"},
+                "group_column": {"type": "string", "description": "Column to group by (optional)"},
+                "group_function": {"type": "string", "description": "EQ (exact), MM (month), YY (year), DD (day), QQ (quarter), HH (hour)"},
+                "filter": {"type": "string", "description": "Filter expression (optional)"},
+                "top": {"type": "integer", "description": "Max groups (default: 500)"},
+            },
+            "required": ["table", "measure_column"],
+        },
+    ),
+    Tool(
+        name="count_records",
+        description="Count records in a table without returning data. Much faster and lighter than fetching records.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "Table name"},
+                "filter": {"type": "string", "description": "Filter expression (optional)"},
+            },
+            "required": ["table"],
+        },
+    ),
+    Tool(
+        name="batch_delete",
+        description="Delete multiple records at once (max 500).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "Table name"},
+                "record_ids": {"type": "array", "items": {"type": "integer"}, "description": "Record IDs to delete"},
+                "purge": {"type": "boolean", "description": "Permanently delete without trash (default: false)"},
+                "suppress_triggers": {"type": "boolean", "description": "Suppress workflow triggers (default: false)"},
+            },
+            "required": ["table", "record_ids"],
+        },
+    ),
+    Tool(
+        name="get_changes",
+        description="Get records modified or deleted in a time range. Useful for incremental sync.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "Table name"},
+                "since": {"type": "string", "description": "Start datetime ISO 8601 (e.g. '2026-03-01T00:00:00')"},
+                "until": {"type": "string", "description": "End datetime (optional, defaults to now)"},
+                "change_type": {"type": "string", "description": "'updated' or 'deleted' (default: 'updated')"},
+            },
+            "required": ["table", "since"],
+        },
+    ),
+    Tool(
+        name="list_views",
+        description="List all available views for a table",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "Table name"},
+            },
+            "required": ["table"],
+        },
+    ),
+    Tool(
+        name="relationship_map",
+        description="Show relationships between tables (references, lookups, summaries). Returns Mermaid diagram.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "Specific table (optional, maps all if empty)"},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="compare_records",
+        description="Compare two records and show differences",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "Table name"},
+                "record_id_1": {"type": "integer", "description": "First record ID"},
+                "record_id_2": {"type": "integer", "description": "Second record ID"},
+                "columns": {"type": "array", "items": {"type": "string"}, "description": "Columns to compare (optional)"},
+            },
+            "required": ["table", "record_id_1", "record_id_2"],
+        },
+    ),
+    Tool(
+        name="data_quality_report",
+        description="Generate a data quality report: empty fields, duplicates, value distributions",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "Table name"},
+                "sample_size": {"type": "integer", "description": "Records to analyze (default: 100)"},
+            },
+            "required": ["table"],
+        },
+    ),
 ]
+
+# Schema cache for smart_query (avoids repeated describe_table calls)
+_schema_cache: dict[str, dict] = {}
+_table_list_cache: Optional[list[str]] = None
 
 CACHEABLE_OPERATIONS = {"list_tables", "describe_table"}
 
@@ -538,6 +683,149 @@ CONTEXTO:
 - Coluna de filtro por usina: [Instalação] (código numérico) ou [Nome da Usina].
 """,
 )
+
+
+
+# ============================================================================
+# RESOURCES — semi-static data the LLM can read without calling tools
+# ============================================================================
+
+GOTCHAS_DATA = {
+    "filter_syntax": {
+        "LIKE_not_supported": "Use Contains([Campo], 'valor') instead of LIKE '%valor%'",
+        "operators_lowercase": "Use 'and', 'or', 'not' (lowercase). 'AND'/'OR' cause errors.",
+        "dates_format": "Use #YYYY-MM-DD# (with hashes). Not 'YYYY-MM-DD' or DD/MM/YYYY.",
+        "Contains_wildcard_broken": "Contains([*], 'text') does NOT work in REST API (400 error). Use schema-based search.",
+    },
+    "write_operations": {
+        "body_must_be_array": "POST body must be [{...}], not {...}. Single object causes 405.",
+        "update_requires_row_id": "Use '@row.id' (internal), NOT user-defined 'Id' column.",
+        "scientific_notation": "Small floats (< 0.0001) serialize as '2e-05'. TeamDesk rejects. Use string format.",
+        "suppress_triggers": "Add ?workflow=0 to suppress triggers (requires ManageData).",
+        "delete_uses_GET": "DELETE endpoint uses GET method: GET /table/delete.json?id=123",
+    },
+    "column_names": {
+        "accents_required": "Column names must use exact accents: Geração, Instalação, Irradiação, Potência, Mês.",
+        "Sum_vs_plus": "Sum([A],[B],[C]) ignores nulls. [A]+[B]+[C] propagates null.",
+    },
+    "endpoints": {
+        "select_endpoint": "Use /table/select.json (NOT /table.json — 405 error)",
+        "document_no_json": "Document endpoint: /table/doc/document (NO .json suffix)",
+        "sort_syntax": "Sort: 'Column//DESC' (double slash, not dash)",
+    },
+}
+
+PROMPTS = [
+    Prompt(
+        name="consulta-geracao",
+        description="Consultar geração de energia de uma usina",
+        arguments=[
+            PromptArgument(name="usina", description="Nome da usina (ex: Paracatu, Iturama)", required=True),
+            PromptArgument(name="periodo", description="Período (ex: 'janeiro 2026', 'último mês')", required=False),
+        ],
+    ),
+    Prompt(
+        name="auditoria-tabela",
+        description="Auditar qualidade dos dados de uma tabela",
+        arguments=[
+            PromptArgument(name="tabela", description="Nome da tabela", required=True),
+        ],
+    ),
+    Prompt(
+        name="debug-filter",
+        description="Depurar um filtro que não retorna resultados",
+        arguments=[
+            PromptArgument(name="tabela", description="Nome da tabela", required=True),
+            PromptArgument(name="filtro", description="Filtro que está falhando", required=True),
+        ],
+    ),
+]
+
+
+@mcp_server.list_resources()
+async def handle_list_resources() -> list[Resource]:
+    return [
+        Resource(uri="teamdesk://gotchas", name="TeamDesk API Gotchas", description="Critical API gotchas that prevent common errors", mimeType="application/json"),
+    ]
+
+
+@mcp_server.read_resource()
+async def handle_read_resource(uri) -> str:
+    uri_str = str(uri)
+    if uri_str == "teamdesk://gotchas":
+        return json.dumps(GOTCHAS_DATA, indent=2, ensure_ascii=False)
+    return json.dumps({"error": f"Unknown resource: {uri_str}"})
+
+
+@mcp_server.list_prompts()
+async def handle_list_prompts() -> list[Prompt]:
+    return PROMPTS
+
+
+@mcp_server.get_prompt()
+async def handle_get_prompt(name: str, arguments: dict | None = None) -> GetPromptResult:
+    args = arguments or {}
+
+    if name == "consulta-geracao":
+        usina = args.get("usina", "")
+        periodo = args.get("periodo", "último mês")
+        return GetPromptResult(
+            description=f"Consultar geração de {usina}",
+            messages=[PromptMessage(role="user", content=TextContent(
+                type="text",
+                text=f"""Consulte a geração de energia da usina "{usina}" no período "{periodo}".
+
+Passos recomendados:
+1. Use aggregate_query na tabela "Geracao_Dia" com measure_column="Geracao dia (kWh)", measure_function="SUM", group_column="Data", group_function="MM"
+2. Filtre por Contains([Unidade Geradora], '{usina}') e o período
+3. Compare com o P90 na tabela "Geração Mensal" (coluna "Geracao P90 (kWh)")
+4. Calcule Performance Ratio: (Geração Real / P90) × 100
+
+Formato brasileiro (1.234,56 kWh), lista compacta."""
+            ))],
+        )
+
+    elif name == "auditoria-tabela":
+        tabela = args.get("tabela", "")
+        return GetPromptResult(
+            description=f"Auditoria de {tabela}",
+            messages=[PromptMessage(role="user", content=TextContent(
+                type="text",
+                text=f"""Audite a qualidade dos dados na tabela "{tabela}".
+
+Passos:
+1. describe_table para ver a estrutura
+2. count_records para o total
+3. aggregate_query com COUNT para verificar preenchimento por coluna
+4. Detectar registros sem campos obrigatórios, valores fora do esperado (MIN/MAX), duplicatas
+
+Reporte: total, % campos vazios, anomalias."""
+            ))],
+        )
+
+    elif name == "debug-filter":
+        tabela = args.get("tabela", "")
+        filtro = args.get("filtro", "")
+        return GetPromptResult(
+            description=f"Debug filtro em {tabela}",
+            messages=[PromptMessage(role="user", content=TextContent(
+                type="text",
+                text=f"""O filtro abaixo não retorna resultados na tabela "{tabela}":
+```
+{filtro}
+```
+
+Diagnóstico:
+1. smart_query (auto-corrige acentos, datas, LIKE→Contains, AND→and)
+2. count_records sem filtro (tabela tem dados?)
+3. describe_table (nomes exatos das colunas)
+4. Testar cada condição separadamente
+
+Gotchas: Geracao→Geração, '2026-01-01'→#2026-01-01#, LIKE→Contains(), AND→and"""
+            ))],
+        )
+
+    return GetPromptResult(description="Unknown prompt", messages=[])
 
 
 @mcp_server.list_tools()
@@ -634,8 +922,11 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         if err:
             return {"error": err}
         table = sanitize_table_name(args["table"])
-        # CORRECT: POST {table}/create.json with body=[{data}] (NOT POST {table}.json)
-        return await http_client.request("POST", token, f"{table}/create.json", json_data=[args["data"]])
+        endpoint = f"{table}/create.json"
+        params = {}
+        if args.get("suppress_triggers"):
+            params["workflow"] = 0
+        return await http_client.request("POST", token, endpoint, params=params if params else None, json_data=[args["data"]])
 
     elif name == "update_record":
         err = validate_required(args, ["table", "record_id", "data"])
@@ -644,9 +935,10 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         table = sanitize_table_name(args["table"])
         record_id = int(args["record_id"])
         update_data = {**args["data"], "@row.id": record_id}
-        # CORRECT: POST {table}/update.json with body=[{"@row.id": id, ...}]
-        # (NOT PUT {table}/{id}.json)
-        return await http_client.request("POST", token, f"{table}/update.json", json_data=[update_data])
+        params = {}
+        if args.get("suppress_triggers"):
+            params["workflow"] = 0
+        return await http_client.request("POST", token, f"{table}/update.json", params=params if params else None, json_data=[update_data])
 
     elif name == "delete_record":
         err = validate_required(args, ["table", "record_id"])
@@ -663,6 +955,8 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
             return {"error": err}
         table = sanitize_table_name(args["table"])
         params = {"match": args["match_column"]}
+        if args.get("suppress_triggers"):
+            params["workflow"] = 0
         return await http_client.request("POST", token, f"{table}/upsert.json", params=params, json_data=args["records"])
 
     elif name == "select_from_view":
@@ -679,37 +973,36 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         err = validate_required(args, ["table", "search_text"])
         if err:
             return {"error": err}
-        table = sanitize_table_name(args["table"])
+        raw_table = args["table"]
+        table_enc = sanitize_table_name(raw_table)
         safe_text = sanitize_search_text(args["search_text"])
+        _SEARCHABLE_TYPES = {"Text", "Multiline", "Link", "Email", "Phone", "URL"}
+        _MAX_SEARCH_COLS = 10
 
-        # Determine which columns to search in
-        search_cols = args.get("search_columns")
-        if search_cols:
-            cols_to_search = search_cols if isinstance(search_cols, list) else [search_cols]
-        else:
-            # Auto-detect text columns via describe.json
-            schema = await http_client.request("GET", token, f"{table}/describe.json")
-            if "error" in schema:
-                return {"error": f"Cannot get schema: {schema['error']}"}
-            text_types = {"Text", "Memo", "Email", "Phone", "URL", "Autonumber"}
-            cols_to_search = [
-                col["name"] for col in schema.get("columns", [])
-                if col.get("type") in text_types
-            ]
-            if not cols_to_search:
-                return {"error": "No text columns found in table to search"}
-
-        # Build Or(Contains(...), ...) filter
-        parts = [f"Contains([{c}], '{safe_text}')" for c in cols_to_search]
-        filter_expr = parts[0] if len(parts) == 1 else f"Or({', '.join(parts)})"
+        # Get schema to find searchable text columns (NOT broken [*] wildcard)
+        if raw_table not in _schema_cache:
+            schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
+            if "error" not in schema_res:
+                _schema_cache[raw_table] = schema_res
+        schema = _schema_cache.get(raw_table)
+        if not schema:
+            return {"error": f"Could not get schema for table '{raw_table}'"}
+        text_cols = [
+            c["name"] for c in schema.get("columns", [])
+            if c.get("type") in _SEARCHABLE_TYPES
+        ][:_MAX_SEARCH_COLS]
+        if not text_cols:
+            return {"error": f"No searchable text columns in table '{raw_table}'"}
+        parts = [f"Contains([{col}], '{safe_text}')" for col in text_cols]
+        search_filter = " or ".join(parts)
 
         params = {
-            "filter": filter_expr,
+            "filter": search_filter,
             "top": min(args.get("top", 50), 500),
         }
         if args.get("columns"):
             params["column"] = args["columns"]
-        return await http_client.request("GET", token, f"{table}/select.json", params=params)
+        return await http_client.request("GET", token, f"{table_enc}/select.json", params=params)
 
     elif name == "get_attachment_url":
         err = validate_required(args, ["table", "column", "record_id"])
@@ -725,6 +1018,541 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
             f"/{table}/{column}/attachment?id={record_id}"
         )
         return {"url": url}
+
+    elif name == "smart_query":
+        err = validate_required(args, ["table"])
+        if err:
+            return {"error": err}
+
+        corrections_log = []
+
+        # 1. Check and fix table name
+        table_check = check_table_name(args["table"])
+        if table_check["issues"]:
+            corrections_log.extend(f"Tabela: {i['message']}" for i in table_check["issues"])
+        resolved_table = table_check["corrected"]
+
+        # 2. Get schema for column validation (with cache)
+        schema = None
+        if resolved_table in _schema_cache:
+            schema = _schema_cache[resolved_table]
+        else:
+            table_enc = sanitize_table_name(resolved_table)
+            schema_result = await http_client.request("GET", token, f"{table_enc}/describe.json")
+            if "error" not in schema_result:
+                _schema_cache[resolved_table] = schema_result
+                schema = schema_result
+
+        # 3. Check and fix filter
+        resolved_filter = args.get("filter")
+        if resolved_filter:
+            filter_check = check_filter(resolved_filter, schema)
+            if filter_check["issues"]:
+                corrections_log.extend(f"Filtro: {i['message']}" for i in filter_check["issues"])
+            resolved_filter = filter_check["corrected"]
+
+        # 4. Check and fix columns
+        resolved_columns = args.get("columns")
+        if resolved_columns:
+            col_check = check_columns(resolved_columns, schema)
+            if col_check["issues"]:
+                corrections_log.extend(f"Coluna: {i['message']}" for i in col_check["issues"])
+            resolved_columns = col_check["corrected"]
+
+        # 5. Execute the corrected query
+        table_enc = sanitize_table_name(resolved_table)
+        params = {}
+        if resolved_filter:
+            params["filter"] = resolved_filter
+        if resolved_columns:
+            params["column"] = resolved_columns
+        if args.get("top"):
+            params["top"] = min(args["top"], 1000)
+        if args.get("skip"):
+            params["skip"] = args["skip"]
+        if args.get("sort"):
+            params["sort"] = args["sort"]
+
+        result = await http_client.request("GET", token, f"{table_enc}/select.json", params=params)
+
+        if "error" in result:
+            output = {
+                "error": result["error"],
+                "query_used": {"table": resolved_table, "filter": resolved_filter, "columns": resolved_columns},
+            }
+            if corrections_log:
+                output["corrections_applied"] = corrections_log
+            return output
+
+        records = result if isinstance(result, list) else result.get("records", result)
+        record_count = len(records) if isinstance(records, list) else 0
+
+        # 6. Self-correction loop: if 0 results and filter exists, try broadening
+        if record_count == 0 and resolved_filter:
+            suggestions = broaden_filter(resolved_filter)
+            for suggestion in suggestions:
+                retry_params = {"top": 5 if suggestion["is_diagnostic"] else min(args.get("top", 100), 1000)}
+                if suggestion["filter"]:
+                    retry_params["filter"] = suggestion["filter"]
+                if resolved_columns:
+                    retry_params["column"] = resolved_columns
+                if args.get("sort"):
+                    retry_params["sort"] = args["sort"]
+
+                retry_result = await http_client.request("GET", token, f"{table_enc}/select.json", params=retry_params)
+
+                if "error" in retry_result:
+                    continue
+
+                retry_records = retry_result if isinstance(retry_result, list) else retry_result.get("records", retry_result)
+                retry_count = len(retry_records) if isinstance(retry_records, list) else 0
+
+                if retry_count > 0:
+                    corrections_log.append(f"Self-correction: {suggestion['description']}")
+                    if suggestion["is_diagnostic"]:
+                        output = {
+                            "records": [],
+                            "count": 0,
+                            "_self_correction": {
+                                "status": "original_filter_too_narrow",
+                                "message": f"Filtro original retornou 0 resultados, mas tabela tem dados ({retry_count}+ registros). Revise o filtro.",
+                                "original_filter": resolved_filter,
+                                "sample_record": retry_records[0] if retry_records else None,
+                            },
+                        }
+                    else:
+                        output = {
+                            "records": retry_records,
+                            "count": retry_count,
+                            "_self_correction": {
+                                "status": "broadened",
+                                "strategy": suggestion["strategy"],
+                                "message": suggestion["description"],
+                                "original_filter": resolved_filter,
+                                "broadened_filter": suggestion["filter"],
+                            },
+                        }
+                    if corrections_log:
+                        output["_corrections"] = corrections_log
+                    return output
+
+        # 7. Build response
+        output = {"records": records, "count": record_count}
+        if corrections_log:
+            output["_corrections"] = corrections_log
+            output["_note"] = "Query foi corrigida automaticamente antes da execução"
+        return output
+
+    elif name == "global_search":
+        err = validate_required(args, ["search_text"])
+        if err:
+            return {"error": err}
+
+        search_text = args["search_text"].strip()
+        if not search_text:
+            return {"error": "search_text cannot be empty"}
+
+        safe_text = sanitize_search_text(search_text)
+        top_per_table = min(args.get("top_per_table", 5), 50)
+        _SEARCHABLE_TYPES = {"Text", "Multiline", "Link", "Email", "Phone", "URL"}
+        _MAX_SEARCH_COLS = 10
+
+        # Get table list
+        table_names = args.get("tables")
+        if not table_names:
+            global _table_list_cache
+            if _table_list_cache is None:
+                desc = await http_client.request("GET", token, "describe.json")
+                if "error" not in desc:
+                    _table_list_cache = [t["recordName"] for t in desc.get("tables", [])]
+            table_names = _table_list_cache or []
+            if not table_names:
+                return {"error": "Could not retrieve table list"}
+
+        # Phase 1: Fetch schemas in parallel (for text column discovery)
+        sem = asyncio.Semaphore(8)
+
+        async def get_schema_cached(tbl: str) -> tuple[str, Optional[dict]]:
+            if tbl in _schema_cache:
+                return tbl, _schema_cache[tbl]
+            async with sem:
+                tbl_enc = sanitize_table_name(tbl)
+                res = await http_client.request("GET", token, f"{tbl_enc}/describe.json")
+                if "error" not in res:
+                    _schema_cache[tbl] = res
+                    return tbl, res
+                return tbl, None
+
+        schema_tasks = [get_schema_cached(t) for t in table_names]
+        schema_results = await asyncio.gather(*schema_tasks)
+
+        # Build filters per table using real text columns
+        table_filters = {}
+        skipped = []
+        for tbl, schema in schema_results:
+            if not schema:
+                skipped.append(tbl)
+                continue
+            text_cols = [
+                c["name"] for c in schema.get("columns", [])
+                if c.get("type") in _SEARCHABLE_TYPES
+            ][:_MAX_SEARCH_COLS]
+            if not text_cols:
+                skipped.append(tbl)
+                continue
+            parts = [f"Contains([{col}], '{safe_text}')" for col in text_cols]
+            table_filters[tbl] = " or ".join(parts)
+
+        # Phase 2: Search in parallel
+        async def search_one(tbl: str, filt: str) -> tuple[str, dict]:
+            async with sem:
+                tbl_enc = sanitize_table_name(tbl)
+                params = {"filter": filt, "top": top_per_table}
+                try:
+                    res = await http_client.request("GET", token, f"{tbl_enc}/select.json", params=params)
+                    return tbl, res
+                except Exception as e:
+                    return tbl, {"error": str(e)}
+
+        search_tasks = [search_one(t, f) for t, f in table_filters.items()]
+        raw_results = await asyncio.gather(*search_tasks)
+
+        results = {}
+        errors = {}
+        for tbl, res in raw_results:
+            if "error" in res:
+                errors[tbl] = res["error"]
+                continue
+            records = res if isinstance(res, list) else res.get("records", res)
+            count = len(records) if isinstance(records, list) else 0
+            if count > 0:
+                results[tbl] = {"count": count, "records": records}
+
+        output = {
+            "search_text": search_text,
+            "tables_searched": len(table_filters),
+            "tables_with_results": len(results),
+            "results": results,
+        }
+        if errors:
+            output["errors"] = errors
+        return output
+
+    elif name == "aggregate_query":
+        err = validate_required(args, ["table", "measure_column"])
+        if err:
+            return {"error": err}
+        table_check = check_table_name(args["table"])
+        resolved_table = table_check["corrected"]
+        table_enc = sanitize_table_name(resolved_table)
+
+        # Build column params with aggregation suffixes
+        columns = []
+        if args.get("group_column"):
+            gf = args.get("group_function", "EQ")
+            columns.append(f"{args['group_column']}//{gf}")
+        mf = (args.get("measure_function") or "SUM").upper()
+        valid_funcs = ("SUM", "COUNT", "AVG", "MIN", "MAX", "STDEV", "STDEVP", "VAR", "VARP")
+        if mf not in valid_funcs:
+            return {"error": f"Invalid measure_function: {mf}. Use {', '.join(valid_funcs)}."}
+        columns.append(f"{args['measure_column']}//{mf}")
+
+        params = {"column": columns, "top": min(args.get("top", 500), 500)}
+        if args.get("filter"):
+            # Get schema for filter validation
+            if resolved_table not in _schema_cache:
+                schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
+                if "error" not in schema_res:
+                    _schema_cache[resolved_table] = schema_res
+            schema = _schema_cache.get(resolved_table)
+            filter_check = check_filter(args["filter"], schema)
+            params["filter"] = filter_check["corrected"]
+
+        return await http_client.request("GET", token, f"{table_enc}/select.json", params=params)
+
+    elif name == "count_records":
+        err = validate_required(args, ["table"])
+        if err:
+            return {"error": err}
+        table_check = check_table_name(args["table"])
+        resolved_table = table_check["corrected"]
+        table_enc = sanitize_table_name(resolved_table)
+
+        # Get key column for COUNT aggregation
+        if resolved_table not in _schema_cache:
+            schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
+            if "error" not in schema_res:
+                _schema_cache[resolved_table] = schema_res
+        schema = _schema_cache.get(resolved_table)
+        key_col = "@row.id"
+        if schema:
+            for col in schema.get("columns", []):
+                if col.get("isKey"):
+                    key_col = col["name"]
+                    break
+
+        params = {"column": [f"{key_col}//COUNT"], "top": 1}
+        if args.get("filter"):
+            filter_check = check_filter(args["filter"], schema)
+            params["filter"] = filter_check["corrected"]
+
+        result = await http_client.request("GET", token, f"{table_enc}/select.json", params=params)
+        if "error" in result:
+            return result
+
+        # Extract count from aggregation
+        records = result if isinstance(result, list) else result.get("records", result)
+        count = 0
+        if isinstance(records, list) and records:
+            for v in records[0].values():
+                if isinstance(v, (int, float)):
+                    count = int(v)
+                    break
+        return {"table": resolved_table, "count": count, "filter": args.get("filter")}
+
+    elif name == "batch_delete":
+        err = validate_required(args, ["table", "record_ids"])
+        if err:
+            return {"error": err}
+        table_enc = sanitize_table_name(args["table"])
+        ids = args["record_ids"]
+        if not ids:
+            return {"error": "No record IDs provided"}
+        if len(ids) > 500:
+            return {"error": "Maximum 500 records per batch delete"}
+
+        params = [("id", rid) for rid in ids]
+        if args.get("purge"):
+            params.append(("purge", 1))
+        if args.get("suppress_triggers"):
+            params.append(("workflow", 0))
+
+        qs = urllib.parse.urlencode(params, doseq=True)
+        result = await http_client.request("GET", token, f"{table_enc}/delete.json?{qs}")
+        if "error" in result:
+            return result
+        return {"success": True, "deleted_ids": ids, "count": len(ids)}
+
+    elif name == "get_changes":
+        err = validate_required(args, ["table", "since"])
+        if err:
+            return {"error": err}
+        table_check = check_table_name(args["table"])
+        resolved_table = table_check["corrected"]
+        table_enc = sanitize_table_name(resolved_table)
+
+        change_type = args.get("change_type", "updated")
+        if change_type not in ("updated", "deleted"):
+            return {"error": "change_type must be 'updated' or 'deleted'"}
+
+        params = {"from": args["since"]}
+        if args.get("until"):
+            params["to"] = args["until"]
+
+        result = await http_client.request("GET", token, f"{table_enc}/{change_type}.json", params=params)
+        if "error" in result:
+            return result
+
+        records = result if isinstance(result, list) else result.get("records", result)
+        count = len(records) if isinstance(records, list) else 0
+        return {
+            "table": resolved_table,
+            "change_type": change_type,
+            "since": args["since"],
+            "until": args.get("until"),
+            "count": count,
+            "records": records,
+        }
+
+    elif name == "list_views":
+        err = validate_required(args, ["table"])
+        if err:
+            return {"error": err}
+        table_check = check_table_name(args["table"])
+        resolved_table = table_check["corrected"]
+        table_enc = sanitize_table_name(resolved_table)
+
+        if resolved_table not in _schema_cache:
+            schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
+            if "error" not in schema_res:
+                _schema_cache[resolved_table] = schema_res
+        schema = _schema_cache.get(resolved_table)
+        if not schema:
+            return {"error": f"Could not get schema for '{resolved_table}'"}
+
+        views = schema.get("views", [])
+        return {
+            "table": resolved_table,
+            "views": [{"name": v.get("name"), "type": v.get("type", "?"), "id": v.get("id")} for v in views],
+            "count": len(views),
+        }
+
+    elif name == "relationship_map":
+        raw_table = args.get("table")
+        if raw_table:
+            tables_to_scan = [check_table_name(raw_table)["corrected"]]
+        else:
+            if _table_list_cache is None:
+                desc = await http_client.request("GET", token, "describe.json")
+                if "error" not in desc:
+                    _table_list_cache = [t["recordName"] for t in desc.get("tables", [])]
+            tables_to_scan = _table_list_cache or []
+            if not tables_to_scan:
+                return {"error": "Could not get table list"}
+
+        # Fetch schemas in parallel
+        sem = asyncio.Semaphore(8)
+
+        async def get_schema_for_rel(tbl):
+            if tbl in _schema_cache:
+                return tbl, _schema_cache[tbl]
+            async with sem:
+                tbl_enc = sanitize_table_name(tbl)
+                res = await http_client.request("GET", token, f"{tbl_enc}/describe.json")
+                if "error" not in res:
+                    _schema_cache[tbl] = res
+                    return tbl, res
+                return tbl, None
+
+        schema_results = await asyncio.gather(*[get_schema_for_rel(t) for t in tables_to_scan])
+
+        relationships = []
+        for tbl, schema in schema_results:
+            if not schema:
+                continue
+            for col in schema.get("columns", []):
+                col_type = col.get("type", "")
+                if col_type in ("Link", "Reference", "Lookup", "Summary"):
+                    rel = {"from_table": tbl, "column": col["name"], "type": col_type}
+                    if col.get("relatedTable"):
+                        rel["to_table"] = col["relatedTable"]
+                    elif col.get("options", {}).get("table"):
+                        rel["to_table"] = col["options"]["table"]
+                    relationships.append(rel)
+
+        mermaid_lines = ["graph LR"]
+        seen = set()
+        for r in relationships:
+            if r.get("to_table") and r["type"] in ("Link", "Reference"):
+                key = f"{r['from_table']}-->{r['to_table']}"
+                if key not in seen:
+                    sf = r["from_table"].replace(" ", "_")
+                    st = r["to_table"].replace(" ", "_")
+                    mermaid_lines.append(f"    {sf} -->|{r['column']}| {st}")
+                    seen.add(key)
+
+        return {
+            "relationships": relationships,
+            "count": len(relationships),
+            "mermaid": "\n".join(mermaid_lines) if len(mermaid_lines) > 1 else None,
+        }
+
+    elif name == "compare_records":
+        err = validate_required(args, ["table", "record_id_1", "record_id_2"])
+        if err:
+            return {"error": err}
+        table_check = check_table_name(args["table"])
+        resolved_table = table_check["corrected"]
+        table_enc = sanitize_table_name(resolved_table)
+
+        params1 = {"id": int(args["record_id_1"])}
+        params2 = {"id": int(args["record_id_2"])}
+        if args.get("columns"):
+            params1["column"] = args["columns"]
+            params2["column"] = args["columns"]
+
+        r1, r2 = await asyncio.gather(
+            http_client.request("GET", token, f"{table_enc}/retrieve.json", params=params1),
+            http_client.request("GET", token, f"{table_enc}/retrieve.json", params=params2),
+        )
+
+        if "error" in r1:
+            return {"error": f"Record {args['record_id_1']}: {r1['error']}"}
+        if "error" in r2:
+            return {"error": f"Record {args['record_id_2']}: {r2['error']}"}
+
+        rec1 = r1[0] if isinstance(r1, list) and r1 else r1
+        rec2 = r2[0] if isinstance(r2, list) and r2 else r2
+
+        all_keys = set(list(rec1.keys()) + list(rec2.keys()))
+        differences = {}
+        same_count = 0
+        for key in sorted(all_keys):
+            v1 = rec1.get(key)
+            v2 = rec2.get(key)
+            if v1 != v2:
+                differences[key] = {"record_1": v1, "record_2": v2}
+            else:
+                same_count += 1
+
+        return {
+            "table": resolved_table,
+            "record_1_id": args["record_id_1"],
+            "record_2_id": args["record_id_2"],
+            "differences": differences,
+            "diff_count": len(differences),
+            "same_count": same_count,
+        }
+
+    elif name == "data_quality_report":
+        err = validate_required(args, ["table"])
+        if err:
+            return {"error": err}
+        table_check = check_table_name(args["table"])
+        resolved_table = table_check["corrected"]
+        table_enc = sanitize_table_name(resolved_table)
+
+        if resolved_table not in _schema_cache:
+            schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
+            if "error" not in schema_res:
+                _schema_cache[resolved_table] = schema_res
+        schema = _schema_cache.get(resolved_table)
+        if not schema:
+            return {"error": f"Could not get schema for '{resolved_table}'"}
+
+        columns = schema.get("columns", [])
+        col_names = [c["name"] for c in columns if not c.get("isSystem")]
+
+        sample_size = min(args.get("sample_size", 100), 500)
+        result = await http_client.request("GET", token, f"{table_enc}/select.json", params={"top": sample_size})
+
+        if "error" in result:
+            return result
+
+        records = result if isinstance(result, list) else result.get("records", result)
+        total = len(records) if isinstance(records, list) else 0
+        if total == 0:
+            return {"table": resolved_table, "total_records": 0, "message": "Table is empty"}
+
+        col_stats = {}
+        for col in col_names:
+            values = [r.get(col) for r in records if col in r]
+            non_null = [v for v in values if v is not None and v != "" and v != 0]
+            null_count = total - len(non_null)
+            stat = {
+                "empty_count": null_count,
+                "empty_pct": round(null_count / total * 100, 1),
+                "filled_count": len(non_null),
+            }
+            if non_null and isinstance(non_null[0], str):
+                unique = len(set(non_null))
+                if unique < len(non_null):
+                    stat["duplicate_values"] = len(non_null) - unique
+            col_stats[col] = stat
+
+        empty_cols = sorted(
+            [(k, v["empty_pct"]) for k, v in col_stats.items() if v["empty_pct"] > 0],
+            key=lambda x: x[1], reverse=True,
+        )
+
+        return {
+            "table": resolved_table,
+            "records_analyzed": total,
+            "total_columns": len(col_names),
+            "columns_with_empties": len(empty_cols),
+            "worst_empty_columns": empty_cols[:10],
+            "column_details": col_stats,
+        }
 
     return {"error": f"Unknown tool: {name}"}
 
@@ -756,7 +1584,7 @@ async def health_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "healthy",
         "service": "teamdesk-mcp-server",
-        "version": "3.1.1",
+        "version": "3.3.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -1108,6 +1936,57 @@ async def oauth_token(request: Request) -> JSONResponse:
 
 
 # ============================================================================
+# MOBILE SSE ENDPOINTS (Claude.ai / Claude mobile app)
+# ============================================================================
+
+# Registry of transports per user key (one per user, ~4 users)
+_mobile_transports: dict[str, SseServerTransport] = {}
+
+
+def _get_mobile_transport(chave: str) -> SseServerTransport:
+    if chave not in _mobile_transports:
+        _mobile_transports[chave] = SseServerTransport(f"/m/{chave}/messages")
+    return _mobile_transports[chave]
+
+
+async def mobile_sse_endpoint(request: Request):
+    """SSE endpoint for Claude.ai/mobile - auth via URL path."""
+    chave = request.path_params.get("chave", "")
+    if not chave or not validate_api_key_format(chave):
+        return Response(status_code=404)
+
+    validation = await api_key_validator.validate(chave, http_client)
+    if not validation.valid:
+        return Response(status_code=404)
+
+    logger.info(f"Mobile SSE connect: {validation.user_name} ({chave[:12]}...)")
+    current_user_token.set(validation.token)
+    current_user_key.set(chave)
+    asyncio.create_task(api_key_validator.update_last_use(chave, http_client))
+
+    transport = _get_mobile_transport(chave)
+    async with transport.connect_sse(request.scope, request.receive, request._send) as streams:
+        await mcp_server.run(streams[0], streams[1], mcp_server.create_initialization_options())
+
+
+async def mobile_messages_endpoint(request: Request):
+    """JSON-RPC messages for Claude.ai/mobile - auth via URL path."""
+    chave = request.path_params.get("chave", "")
+    if not chave or not validate_api_key_format(chave):
+        return Response(status_code=404)
+
+    validation = await api_key_validator.validate(chave, http_client)
+    if not validation.valid:
+        return Response(status_code=404)
+
+    current_user_token.set(validation.token)
+    current_user_key.set(chave)
+
+    transport = _get_mobile_transport(chave)
+    await transport.handle_post_message(request.scope, request.receive, request._send)
+
+
+# ============================================================================
 # APP LIFECYCLE
 # ============================================================================
 
@@ -1125,7 +2004,7 @@ async def lifespan(app):
     await http_client.start()
     async with mobile_session_manager.run():
         task = asyncio.create_task(cleanup_task())
-        logger.info(f"TeamDesk MCP Server v3.2.0 (SSE + Streamable HTTP)")
+        logger.info(f"TeamDesk MCP Server v3.3.0 (21 tools + resources + prompts, SSE + Streamable HTTP)")
         logger.info(f"Host: {MCP_HOST}:{MCP_PORT}")
         logger.info(f"Database: {'configured' if TEAMDESK_DATABASE_ID else 'NOT SET'}")
         logger.info(f"Master Token: {'configured' if TEAMDESK_MASTER_TOKEN else 'NOT SET'}")
