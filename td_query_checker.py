@@ -201,6 +201,13 @@ LOGIC_OP_FIXES = [
     {"pattern": r"\bNot\b", "correct": "not", "message": "Not deve ser minúsculo: not"},
 ]
 
+# ---------------------------------------------------------------------------
+# Operator corrections (TeamDesk uses <> not !=)
+# ---------------------------------------------------------------------------
+OPERATOR_FIXES = [
+    {"pattern": r"!=", "correct": "<>", "message": "!= não é suportado no TeamDesk. Use <> (inequality operator)"},
+]
+
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -281,8 +288,8 @@ def check_filter(
                 "fix": rule["fix_hint"],
             })
 
-    # 2. Auto-fix LIKE → Contains
-    like_pattern = r"\[([^\]]+)\]\s+LIKE\s+'%([^']+)%'"
+    # 2. Auto-fix LIKE → Contains (handles all LIKE variants: '%x%', 'x%', '%x', 'x')
+    like_pattern = r"\[([^\]]+)\]\s+LIKE\s+'%?([^'%]+)%?'"
     like_match = re.search(like_pattern, corrected, re.IGNORECASE)
     if like_match:
         col_name = like_match.group(1)
@@ -307,7 +314,18 @@ def check_filter(
                 })
                 corrected = corrected[:m.start()] + rule["fix"](m) + corrected[m.end():]
 
-    # 4. Fix logical operators (AND/OR/NOT → and/or/not)
+    # 4. Fix != → <> (TeamDesk inequality operator)
+    for rule in OPERATOR_FIXES:
+        if re.search(rule["pattern"], corrected):
+            issues.append({
+                "type": "operator",
+                "severity": "error",
+                "message": rule["message"],
+                "fix": f"Corrigido automaticamente para '{rule['correct']}'",
+            })
+            corrected = re.sub(rule["pattern"], rule["correct"], corrected)
+
+    # 5. Fix logical operators (AND/OR/NOT → and/or/not)
     for rule in LOGIC_OP_FIXES:
         if re.search(rule["pattern"], corrected):
             issues.append({

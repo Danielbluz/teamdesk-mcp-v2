@@ -104,6 +104,21 @@ class TestFilterLike:
         r = check_filter("[Nome] LIKE '%Paracatu%'")
         assert "Contains([Nome], 'Paracatu')" in r["corrected"]
 
+    def test_auto_fix_like_prefix_only(self):
+        """LIKE 'Paracatu%' (no leading %) should also be converted."""
+        r = check_filter("[Nome] LIKE 'Paracatu%'")
+        assert "Contains([Nome], 'Paracatu')" in r["corrected"]
+
+    def test_auto_fix_like_suffix_only(self):
+        """LIKE '%Paracatu' (no trailing %) should also be converted."""
+        r = check_filter("[Nome] LIKE '%Paracatu'")
+        assert "Contains([Nome], 'Paracatu')" in r["corrected"]
+
+    def test_auto_fix_like_no_wildcards(self):
+        """LIKE 'Paracatu' (no %) should also be converted."""
+        r = check_filter("[Nome] LIKE 'Paracatu'")
+        assert "Contains([Nome], 'Paracatu')" in r["corrected"]
+
     def test_detect_not_like(self):
         r = check_filter("[Nome] NOT LIKE '%Test%'")
         assert any("NOT LIKE" in i["message"] for i in r["issues"])
@@ -171,6 +186,20 @@ class TestFilterForbiddenOps:
     def test_detect_is_null(self):
         r = check_filter("[Nome] IS NULL")
         assert any("IS NULL" in i["message"] for i in r["issues"])
+
+
+class TestFilterOperators:
+    """!= must be converted to <> (TeamDesk inequality operator)."""
+
+    def test_fix_not_equal(self):
+        r = check_filter("[Status] != 'Inativo'")
+        assert "<>" in r["corrected"]
+        assert "!=" not in r["corrected"]
+        assert r["auto_fixed"]
+
+    def test_no_fix_correct_not_equal(self):
+        r = check_filter("[Status] <> 'Inativo'")
+        assert not r["auto_fixed"]
 
 
 class TestFilterSchemaValidation:

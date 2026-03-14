@@ -897,7 +897,9 @@ async def execute_tool(token: str, name: str, args: dict) -> dict:
 
 async def _run_tool(token: str, name: str, args: dict) -> dict:
     """Execute tool with corrected TeamDesk API endpoints."""
-    logger.info(f"Tool: {name} | Args: {json.dumps(args, ensure_ascii=False)}")
+    # Mask potentially sensitive data in logs (truncate long values)
+    safe_args = {k: (str(v)[:80] + "..." if isinstance(v, (str, list, dict)) and len(str(v)) > 80 else v) for k, v in args.items()}
+    logger.info(f"Tool: {name} | Args: {json.dumps(safe_args, ensure_ascii=False, default=str)}")
     if args.get("table"):
         raw = args["table"]
         logger.info(f"Raw table name: {repr(raw)} | bytes: {raw.encode('utf-8').hex()}")
@@ -954,7 +956,11 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         params = {}
         if args.get("suppress_triggers"):
             params["workflow"] = 0
-        return await http_client.request("POST", token, endpoint, params=params if params else None, json_data=[args["data"]])
+        result = await http_client.request("POST", token, endpoint, params=params if params else None, json_data=[args["data"]])
+        # Check inline errors (HTTP 200 but status:400 inside response)
+        if isinstance(result, list) and result and isinstance(result[0], dict) and result[0].get("status") == 400:
+            return {"error": "Create failed", "details": result[0].get("errors", [])}
+        return result
 
     elif name == "update_record":
         err = validate_required(args, ["table", "record_id", "data"])
@@ -966,7 +972,10 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         params = {}
         if args.get("suppress_triggers"):
             params["workflow"] = 0
-        return await http_client.request("POST", token, f"{table}/update.json", params=params if params else None, json_data=[update_data])
+        result = await http_client.request("POST", token, f"{table}/update.json", params=params if params else None, json_data=[update_data])
+        if isinstance(result, list) and result and isinstance(result[0], dict) and result[0].get("status") == 400:
+            return {"error": "Update failed", "details": result[0].get("errors", [])}
+        return result
 
     elif name == "delete_record":
         err = validate_required(args, ["table", "record_id"])
@@ -985,7 +994,13 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         params = {"match": args["match_column"]}
         if args.get("suppress_triggers"):
             params["workflow"] = 0
-        return await http_client.request("POST", token, f"{table}/upsert.json", params=params, json_data=args["records"])
+        result = await http_client.request("POST", token, f"{table}/upsert.json", params=params, json_data=args["records"])
+        # Check inline errors (HTTP 200 but status:400 inside response)
+        if isinstance(result, list):
+            errors = [r for r in result if isinstance(r, dict) and r.get("status") == 400]
+            if errors:
+                return {"error": f"Upsert: {len(errors)} record(s) failed", "details": [e.get("errors", []) for e in errors]}
+        return result
 
     elif name == "select_from_view":
         err = validate_required(args, ["table", "view"])
@@ -2042,12 +2057,27 @@ async def mobile_messages_endpoint(request: Request):
 # ============================================================================
 
 
+def _cleanup_oauth():
+    """Remove expired OAuth codes and tokens from in-memory stores."""
+    now = time.time()
+    for store in (_oauth_codes, _oauth_tokens):
+        expired = [k for k, v in store.items() if now > v.get("expires_at", 0)]
+        for k in expired:
+            del store[k]
+    # Cleanup old client registrations (keep last 50)
+    if len(_oauth_clients) > 50:
+        oldest = sorted(_oauth_clients, key=lambda k: _oauth_clients[k].get("created_at", 0))
+        for k in oldest[:len(_oauth_clients) - 50]:
+            del _oauth_clients[k]
+
+
 async def cleanup_task():
     while True:
         await asyncio.sleep(60)
         await rate_limiter.cleanup()
         await cache.cleanup()
         await api_key_validator.cleanup()
+        _cleanup_oauth()
 
 
 @asynccontextmanager
