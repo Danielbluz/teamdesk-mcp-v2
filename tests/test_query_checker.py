@@ -156,15 +156,17 @@ class TestFilterLogicOps:
 
 
 class TestFilterForbiddenOps:
-    """Gotcha: IN, BETWEEN, IS NULL não suportados."""
+    """Gotcha: IS NULL não suportado. In()/Between() ARE valid TeamDesk functions."""
 
-    def test_detect_in(self):
-        r = check_filter("[Status] IN ('Ativo', 'Conectada')")
-        assert any(i["type"] == "forbidden_operator" for i in r["issues"])
+    def test_in_is_valid(self):
+        """In() is a valid TeamDesk Formula Language function — must NOT be blocked."""
+        r = check_filter("In([Status], 'Ativo', 'Conectada')")
+        assert not any(i["type"] == "forbidden_operator" for i in r["issues"])
 
-    def test_detect_between(self):
-        r = check_filter("[Valor] BETWEEN 100 AND 200")
-        assert any("BETWEEN" in i["message"] for i in r["issues"])
+    def test_between_is_valid(self):
+        """Between() is a valid TeamDesk Formula Language function — must NOT be blocked."""
+        r = check_filter("Between([Valor], 100, 200)")
+        assert not any(i["type"] == "forbidden_operator" for i in r["issues"])
 
     def test_detect_is_null(self):
         r = check_filter("[Nome] IS NULL")

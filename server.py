@@ -1241,7 +1241,7 @@ def data_quality_report(table_name: str, sample_size: int = 100) -> str:
     col_stats = {}
     for col in col_names:
         values = [r.get(col) for r in records if col in r]
-        non_null = [v for v in values if v is not None and v != "" and v != 0]
+        non_null = [v for v in values if v is not None and v != ""]
         null_count = total - len(non_null)
 
         stat = {

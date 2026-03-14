@@ -77,7 +77,7 @@ MCP_PUBLIC_URL = os.getenv("MCP_PUBLIC_URL", "https://mcp.forgreen.com.br")
 TEAMDESK_API_BASE = "https://www.teamdesk.net/secure/api/v2"
 
 # API key validation regex: alphanumeric, underscores, hyphens, dots (8-128 chars)
-_API_KEY_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.\*]{8,128}$")
+_API_KEY_PATTERN = re.compile(r"^[a-zA-Z0-9_\-\.]{8,128}$")
 
 
 def validate_api_key_format(api_key: str) -> bool:
@@ -647,9 +647,37 @@ TOOLS = [
     ),
 ]
 
-# Schema cache for smart_query (avoids repeated describe_table calls)
-_schema_cache: dict[str, dict] = {}
-_table_list_cache: Optional[list[str]] = None
+# Schema cache with TTL (avoids stale data after TeamDesk schema changes)
+_schema_cache: dict[str, tuple[dict, float]] = {}  # table -> (schema, expires_at)
+_schema_cache_ttl: int = 600  # 10 minutes
+_table_list_cache: Optional[tuple[list[str], float]] = None  # (tables, expires_at)
+_table_list_cache_ttl: int = 600
+
+
+def _get_cached_schema(table: str) -> Optional[dict]:
+    entry = _schema_cache.get(table)
+    if entry and time.time() < entry[1]:
+        return entry[0]
+    if entry:
+        del _schema_cache[table]
+    return None
+
+
+def _set_cached_schema(table: str, schema: dict):
+    _schema_cache[table] = (schema, time.time() + _schema_cache_ttl)
+
+
+def _get_cached_table_list() -> Optional[list[str]]:
+    global _table_list_cache
+    if _table_list_cache and time.time() < _table_list_cache[1]:
+        return _table_list_cache[0]
+    _table_list_cache = None
+    return None
+
+
+def _set_cached_table_list(tables: list[str]):
+    global _table_list_cache
+    _table_list_cache = (tables, time.time() + _table_list_cache_ttl)
 
 CACHEABLE_OPERATIONS = {"list_tables", "describe_table"}
 
@@ -965,7 +993,7 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
             return {"error": err}
         table = sanitize_table_name(args["table"])
         view = sanitize_table_name(args["view"])
-        params = {"top": min(args.get("top", 100), 1000)}
+        params = {"top": min(args.get("top", 100), 500)}
         # CORRECT: {table}/{view}/select.json (NOT {view}/{table}/select.json)
         return await http_client.request("GET", token, f"{table}/{view}/select.json", params=params)
 
@@ -980,11 +1008,12 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         _MAX_SEARCH_COLS = 10
 
         # Get schema to find searchable text columns (NOT broken [*] wildcard)
-        if raw_table not in _schema_cache:
+        schema = _get_cached_schema(raw_table)
+        if not schema:
             schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
             if "error" not in schema_res:
-                _schema_cache[raw_table] = schema_res
-        schema = _schema_cache.get(raw_table)
+                _set_cached_schema(raw_table, schema_res)
+                schema = schema_res
         if not schema:
             return {"error": f"Could not get schema for table '{raw_table}'"}
         text_cols = [
@@ -1032,15 +1061,13 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
             corrections_log.extend(f"Tabela: {i['message']}" for i in table_check["issues"])
         resolved_table = table_check["corrected"]
 
-        # 2. Get schema for column validation (with cache)
-        schema = None
-        if resolved_table in _schema_cache:
-            schema = _schema_cache[resolved_table]
-        else:
+        # 2. Get schema for column validation (with TTL cache)
+        schema = _get_cached_schema(resolved_table)
+        if not schema:
             table_enc = sanitize_table_name(resolved_table)
             schema_result = await http_client.request("GET", token, f"{table_enc}/describe.json")
             if "error" not in schema_result:
-                _schema_cache[resolved_table] = schema_result
+                _set_cached_schema(resolved_table, schema_result)
                 schema = schema_result
 
         # 3. Check and fix filter
@@ -1091,7 +1118,7 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         if record_count == 0 and resolved_filter:
             suggestions = broaden_filter(resolved_filter)
             for suggestion in suggestions:
-                retry_params = {"top": 5 if suggestion["is_diagnostic"] else min(args.get("top", 100), 1000)}
+                retry_params = {"top": 5 if suggestion["is_diagnostic"] else min(args.get("top", 100), 500)}
                 if suggestion["filter"]:
                     retry_params["filter"] = suggestion["filter"]
                 if resolved_columns:
@@ -1160,12 +1187,12 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         # Get table list
         table_names = args.get("tables")
         if not table_names:
-            global _table_list_cache
-            if _table_list_cache is None:
+            table_names = _get_cached_table_list()
+            if not table_names:
                 desc = await http_client.request("GET", token, "describe.json")
                 if "error" not in desc:
-                    _table_list_cache = [t["recordName"] for t in desc.get("tables", [])]
-            table_names = _table_list_cache or []
+                    table_names = [t["recordName"] for t in desc.get("tables", [])]
+                    _set_cached_table_list(table_names)
             if not table_names:
                 return {"error": "Could not retrieve table list"}
 
@@ -1173,13 +1200,14 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         sem = asyncio.Semaphore(8)
 
         async def get_schema_cached(tbl: str) -> tuple[str, Optional[dict]]:
-            if tbl in _schema_cache:
-                return tbl, _schema_cache[tbl]
+            cached = _get_cached_schema(tbl)
+            if cached:
+                return tbl, cached
             async with sem:
                 tbl_enc = sanitize_table_name(tbl)
                 res = await http_client.request("GET", token, f"{tbl_enc}/describe.json")
                 if "error" not in res:
-                    _schema_cache[tbl] = res
+                    _set_cached_schema(tbl, res)
                     return tbl, res
                 return tbl, None
 
@@ -1260,11 +1288,12 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         params = {"column": columns, "top": min(args.get("top", 500), 500)}
         if args.get("filter"):
             # Get schema for filter validation
-            if resolved_table not in _schema_cache:
+            schema = _get_cached_schema(resolved_table)
+            if not schema:
                 schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
                 if "error" not in schema_res:
-                    _schema_cache[resolved_table] = schema_res
-            schema = _schema_cache.get(resolved_table)
+                    _set_cached_schema(resolved_table, schema_res)
+                    schema = schema_res
             filter_check = check_filter(args["filter"], schema)
             params["filter"] = filter_check["corrected"]
 
@@ -1279,11 +1308,12 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         table_enc = sanitize_table_name(resolved_table)
 
         # Get key column for COUNT aggregation
-        if resolved_table not in _schema_cache:
+        schema = _get_cached_schema(resolved_table)
+        if not schema:
             schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
             if "error" not in schema_res:
-                _schema_cache[resolved_table] = schema_res
-        schema = _schema_cache.get(resolved_table)
+                _set_cached_schema(resolved_table, schema_res)
+                schema = schema_res
         key_col = None
         if schema:
             for col in schema.get("columns", []):
@@ -1376,11 +1406,12 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         resolved_table = table_check["corrected"]
         table_enc = sanitize_table_name(resolved_table)
 
-        if resolved_table not in _schema_cache:
+        schema = _get_cached_schema(resolved_table)
+        if not schema:
             schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
             if "error" not in schema_res:
-                _schema_cache[resolved_table] = schema_res
-        schema = _schema_cache.get(resolved_table)
+                _set_cached_schema(resolved_table, schema_res)
+                schema = schema_res
         if not schema:
             return {"error": f"Could not get schema for '{resolved_table}'"}
 
@@ -1396,11 +1427,12 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         if raw_table:
             tables_to_scan = [check_table_name(raw_table)["corrected"]]
         else:
-            if _table_list_cache is None:
+            tables_to_scan = _get_cached_table_list()
+            if not tables_to_scan:
                 desc = await http_client.request("GET", token, "describe.json")
                 if "error" not in desc:
-                    _table_list_cache = [t["recordName"] for t in desc.get("tables", [])]
-            tables_to_scan = _table_list_cache or []
+                    tables_to_scan = [t["recordName"] for t in desc.get("tables", [])]
+                    _set_cached_table_list(tables_to_scan)
             if not tables_to_scan:
                 return {"error": "Could not get table list"}
 
@@ -1408,13 +1440,14 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         sem = asyncio.Semaphore(8)
 
         async def get_schema_for_rel(tbl):
-            if tbl in _schema_cache:
-                return tbl, _schema_cache[tbl]
+            cached = _get_cached_schema(tbl)
+            if cached:
+                return tbl, cached
             async with sem:
                 tbl_enc = sanitize_table_name(tbl)
                 res = await http_client.request("GET", token, f"{tbl_enc}/describe.json")
                 if "error" not in res:
-                    _schema_cache[tbl] = res
+                    _set_cached_schema(tbl, res)
                     return tbl, res
                 return tbl, None
 
@@ -1506,11 +1539,12 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         resolved_table = table_check["corrected"]
         table_enc = sanitize_table_name(resolved_table)
 
-        if resolved_table not in _schema_cache:
+        schema = _get_cached_schema(resolved_table)
+        if not schema:
             schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
             if "error" not in schema_res:
-                _schema_cache[resolved_table] = schema_res
-        schema = _schema_cache.get(resolved_table)
+                _set_cached_schema(resolved_table, schema_res)
+                schema = schema_res
         if not schema:
             return {"error": f"Could not get schema for '{resolved_table}'"}
 
@@ -1531,7 +1565,7 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         col_stats = {}
         for col in col_names:
             values = [r.get(col) for r in records if col in r]
-            non_null = [v for v in values if v is not None and v != "" and v != 0]
+            non_null = [v for v in values if v is not None and v != ""]
             null_count = total - len(non_null)
             stat = {
                 "empty_count": null_count,
@@ -1567,10 +1601,15 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
 
 
 async def setup_endpoint(request: Request) -> JSONResponse:
-    """Validates API key and returns token for local MCP configuration."""
+    """Validates API key. Does NOT return the TeamDesk token (security)."""
     api_key = request.headers.get("X-API-Key")
     if not api_key:
         return JSONResponse({"error": "X-API-Key header required"}, status_code=401)
+
+    # Rate limit setup endpoint to prevent brute force
+    allowed, _ = await rate_limiter.is_allowed(f"setup:{api_key[:8]}")
+    if not allowed:
+        return JSONResponse({"error": "Rate limit exceeded"}, status_code=429)
 
     validation = await api_key_validator.validate(api_key, http_client)
     if not validation.valid:
@@ -1579,7 +1618,6 @@ async def setup_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({
         "valid": True,
         "name": validation.user_name,
-        "token": validation.token,
         "database_id": TEAMDESK_DATABASE_ID,
     })
 
@@ -1620,12 +1658,16 @@ async def tools_list_endpoint(request: Request) -> JSONResponse:
 
 
 async def tools_call_endpoint(request: Request) -> Response:
-    client_ip = request.client.host if request.client else "unknown"
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
+    # API key from header ONLY (no query param)
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        return JSONResponse(
+            {"error": "API key required (header X-API-Key)"}, status_code=401,
+            headers={"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY"},
+        )
 
-    allowed, remaining = await rate_limiter.is_allowed(client_ip)
+    # Rate limit by API key (NOT IP — X-Forwarded-For is spoofable)
+    allowed, remaining = await rate_limiter.is_allowed(api_key)
     headers = {
         "X-RateLimit-Limit": str(MCP_RATE_LIMIT),
         "X-RateLimit-Remaining": str(remaining),
@@ -1636,13 +1678,6 @@ async def tools_call_endpoint(request: Request) -> Response:
     if not allowed:
         return JSONResponse(
             {"error": "Rate limit exceeded"}, status_code=429, headers=headers,
-        )
-
-    # API key from header ONLY (no query param)
-    api_key = request.headers.get("X-API-Key")
-    if not api_key:
-        return JSONResponse(
-            {"error": "API key required (header X-API-Key)"}, status_code=401, headers=headers,
         )
 
     validation = await api_key_validator.validate(api_key, http_client)
@@ -1944,13 +1979,25 @@ async def oauth_token(request: Request) -> JSONResponse:
 # ============================================================================
 
 # Registry of transports per user key (one per user, ~4 users)
-_mobile_transports: dict[str, SseServerTransport] = {}
+_mobile_transports: dict[str, tuple[SseServerTransport, float]] = {}  # chave -> (transport, last_used)
+
+
+_MAX_MOBILE_TRANSPORTS = 20
 
 
 def _get_mobile_transport(chave: str) -> SseServerTransport:
-    if chave not in _mobile_transports:
-        _mobile_transports[chave] = SseServerTransport(f"/m/{chave}/messages")
-    return _mobile_transports[chave]
+    if chave in _mobile_transports:
+        transport, _ = _mobile_transports[chave]
+        _mobile_transports[chave] = (transport, time.time())
+        return transport
+    transport = SseServerTransport(f"/m/{chave}/messages")
+    _mobile_transports[chave] = (transport, time.time())
+    # LRU cleanup: keep only the most recent N transports
+    if len(_mobile_transports) > _MAX_MOBILE_TRANSPORTS:
+        oldest = sorted(_mobile_transports, key=lambda k: _mobile_transports[k][1])
+        for k in oldest[:len(_mobile_transports) - _MAX_MOBILE_TRANSPORTS]:
+            del _mobile_transports[k]
+    return transport
 
 
 async def mobile_sse_endpoint(request: Request):

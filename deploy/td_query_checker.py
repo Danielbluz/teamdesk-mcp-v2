@@ -140,16 +140,8 @@ FORBIDDEN_PATTERNS = [
         "message": "LIKE não é suportado no TeamDesk. Use Contains([campo], 'valor')",
         "fix_hint": "LIKE '%X%' → Contains([campo], 'X')",
     },
-    {
-        "pattern": r"\bIN\s*\(",
-        "message": "IN() não é suportado. Use múltiplos OR: [campo]='a' or [campo]='b'",
-        "fix_hint": "IN('a','b') → [campo]='a' or [campo]='b'",
-    },
-    {
-        "pattern": r"\bBETWEEN\b",
-        "message": "BETWEEN não é suportado. Use >= AND <=",
-        "fix_hint": "BETWEEN a AND b → [campo]>=a and [campo]<=b",
-    },
+    # NOTE: In() and Between() are VALID TeamDesk Formula Language functions.
+    # Do NOT block them. See: teamdesk.net/help/working-with-formulas/formula-language-reference/
     {
         "pattern": r"\bIS\s+NULL\b",
         "message": "IS NULL não é suportado. Use IsNull([campo])",
