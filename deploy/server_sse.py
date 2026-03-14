@@ -1425,19 +1425,19 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
             if not schema:
                 continue
             for col in schema.get("columns", []):
-                col_type = col.get("type", "")
-                if col_type in ("Link", "Reference", "Lookup", "Summary"):
-                    rel = {"from_table": tbl, "column": col["name"], "type": col_type}
-                    if col.get("relatedTable"):
-                        rel["to_table"] = col["relatedTable"]
-                    elif col.get("options", {}).get("table"):
-                        rel["to_table"] = col["options"]["table"]
+                col_kind = col.get("kind", "")
+                col_ref = col.get("reference")
+                if col_kind in ("Lookup", "Summary") or col_ref:
+                    rel = {"from_table": tbl, "column": col["name"], "kind": col_kind}
+                    if col_ref and isinstance(col_ref, dict):
+                        rel["to_table"] = col_ref.get("table", "")
+                        rel["ref_type"] = col_ref.get("type", "")
                     relationships.append(rel)
 
         mermaid_lines = ["graph LR"]
         seen = set()
         for r in relationships:
-            if r.get("to_table") and r["type"] in ("Link", "Reference"):
+            if r.get("to_table"):
                 key = f"{r['from_table']}-->{r['to_table']}"
                 if key not in seen:
                     sf = r["from_table"].replace(" ", "_")
