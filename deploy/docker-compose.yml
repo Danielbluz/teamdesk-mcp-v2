@@ -1,17 +1,8 @@
 services:
   teamdesk-mcp:
-    image: python:3.11-slim
+    build: .
     container_name: teamdesk-mcp
     restart: unless-stopped
-    working_dir: /app
-    volumes:
-      - ./server_sse.py:/app/server_sse.py:ro
-      - ./td_query_checker.py:/app/td_query_checker.py:ro
-    command: >
-      bash -c "
-        pip install -q httpx mcp python-dotenv starlette uvicorn pydantic &&
-        python -m uvicorn server_sse:app --host 0.0.0.0 --port 8080
-      "
     environment:
       - LANG=C.UTF-8
       - LC_ALL=C.UTF-8
