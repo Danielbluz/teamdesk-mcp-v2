@@ -38,7 +38,7 @@ logger = logging.getLogger("teamdesk-mcp")
 
 import httpx
 from dotenv import load_dotenv
-from td_query_checker import check_filter, check_columns, check_table_name, broaden_filter
+from td_query_checker import check_filter, check_columns, check_table_name, check_upsert, broaden_filter
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -920,18 +920,26 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         err = validate_required(args, ["table"])
         if err:
             return {"error": err}
-        table = sanitize_table_name(args["table"])
+        table_check = check_table_name(args["table"])
+        table = sanitize_table_name(table_check["corrected"])
         params = {}
         if args.get("filter"):
-            params["filter"] = args["filter"]
+            # Validate/auto-correct filter against schema
+            schema = _get_cached_schema(table_check["corrected"])
+            if not schema:
+                schema_res = await http_client.request("GET", token, f"{table}/describe.json")
+                if "error" not in schema_res:
+                    _set_cached_schema(table_check["corrected"], schema_res)
+                    schema = schema_res
+            filter_check = check_filter(args["filter"], schema)
+            params["filter"] = filter_check["corrected"]
         if args.get("columns"):
             params["column"] = args["columns"]
         if args.get("top"):
-            params["top"] = min(args["top"], 1000)
+            params["top"] = min(args["top"], 500)
         if args.get("skip"):
             params["skip"] = args["skip"]
         if args.get("sort"):
-            # CORRECT: sort=Column//DESC (NOT separate desc param)
             params["sort"] = args["sort"]
         return await http_client.request("GET", token, f"{table}/select.json", params=params)
 
@@ -952,11 +960,16 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         if err:
             return {"error": err}
         table = sanitize_table_name(args["table"])
+        # Validate/auto-correct field names (accents, scientific notation)
+        upsert_check = check_upsert(args["data"])
+        data = upsert_check["corrected"]
+        if not isinstance(data, list):
+            data = [data]
         endpoint = f"{table}/create.json"
         params = {}
         if args.get("suppress_triggers"):
             params["workflow"] = 0
-        result = await http_client.request("POST", token, endpoint, params=params if params else None, json_data=[args["data"]])
+        result = await http_client.request("POST", token, endpoint, params=params if params else None, json_data=data)
         # Check inline errors (HTTP 200 but status:400 inside response)
         if isinstance(result, list) and result and isinstance(result[0], dict) and result[0].get("status") == 400:
             return {"error": "Create failed", "details": result[0].get("errors", [])}
@@ -968,7 +981,12 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
             return {"error": err}
         table = sanitize_table_name(args["table"])
         record_id = int(args["record_id"])
-        update_data = {**args["data"], "@row.id": record_id}
+        # Validate/auto-correct field names
+        upsert_check = check_upsert(args["data"])
+        corrected_data = upsert_check["corrected"]
+        if isinstance(corrected_data, list):
+            corrected_data = corrected_data[0] if corrected_data else {}
+        update_data = {**corrected_data, "@row.id": record_id}
         params = {}
         if args.get("suppress_triggers"):
             params["workflow"] = 0
@@ -991,10 +1009,13 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         if err:
             return {"error": err}
         table = sanitize_table_name(args["table"])
+        # Validate/auto-correct field names and detect scientific notation
+        upsert_check = check_upsert(args["records"])
+        records = upsert_check["corrected"]
         params = {"match": args["match_column"]}
         if args.get("suppress_triggers"):
             params["workflow"] = 0
-        result = await http_client.request("POST", token, f"{table}/upsert.json", params=params, json_data=args["records"])
+        result = await http_client.request("POST", token, f"{table}/upsert.json", params=params, json_data=records)
         # Check inline errors (HTTP 200 but status:400 inside response)
         if isinstance(result, list):
             errors = [r for r in result if isinstance(r, dict) and r.get("status") == 400]
@@ -1022,19 +1043,23 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         _SEARCHABLE_TYPES = {"Text", "Multiline", "Link", "Email", "Phone", "URL"}
         _MAX_SEARCH_COLS = 10
 
-        # Get schema to find searchable text columns (NOT broken [*] wildcard)
-        schema = _get_cached_schema(raw_table)
-        if not schema:
-            schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
-            if "error" not in schema_res:
-                _set_cached_schema(raw_table, schema_res)
-                schema = schema_res
-        if not schema:
-            return {"error": f"Could not get schema for table '{raw_table}'"}
-        text_cols = [
-            c["name"] for c in schema.get("columns", [])
-            if c.get("type") in _SEARCHABLE_TYPES
-        ][:_MAX_SEARCH_COLS]
+        # Use explicit search_columns if provided, otherwise auto-detect
+        if args.get("search_columns"):
+            text_cols = args["search_columns"][:_MAX_SEARCH_COLS]
+        else:
+            # Get schema to find searchable text columns (NOT broken [*] wildcard)
+            schema = _get_cached_schema(raw_table)
+            if not schema:
+                schema_res = await http_client.request("GET", token, f"{table_enc}/describe.json")
+                if "error" not in schema_res:
+                    _set_cached_schema(raw_table, schema_res)
+                    schema = schema_res
+            if not schema:
+                return {"error": f"Could not get schema for table '{raw_table}'"}
+            text_cols = [
+                c["name"] for c in schema.get("columns", [])
+                if c.get("type") in _SEARCHABLE_TYPES
+            ][:_MAX_SEARCH_COLS]
         if not text_cols:
             return {"error": f"No searchable text columns in table '{raw_table}'"}
         parts = [f"Contains([{col}], '{safe_text}')" for col in text_cols]
@@ -1488,8 +1513,8 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
             if r.get("to_table"):
                 key = f"{r['from_table']}-->{r['to_table']}"
                 if key not in seen:
-                    sf = r["from_table"].replace(" ", "_")
-                    st = r["to_table"].replace(" ", "_")
+                    sf = re.sub(r'[^a-zA-Z0-9_]', '_', r["from_table"])
+                    st = re.sub(r'[^a-zA-Z0-9_]', '_', r["to_table"])
                     mermaid_lines.append(f"    {sf} -->|{r['column']}| {st}")
                     seen.add(key)
 

@@ -9,6 +9,7 @@ Usage:
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -1124,8 +1125,8 @@ def relationship_map(table_name: str = None) -> str:
         if r.get("to_table"):
             key = f"{r['from_table']}-->{r['to_table']}"
             if key not in seen:
-                safe_from = r["from_table"].replace(" ", "_")
-                safe_to = r["to_table"].replace(" ", "_")
+                safe_from = re.sub(r'[^a-zA-Z0-9_]', '_', r["from_table"])
+                safe_to = re.sub(r'[^a-zA-Z0-9_]', '_', r["to_table"])
                 mermaid_lines.append(f"    {safe_from} -->|{r['column']}| {safe_to}")
                 seen.add(key)
 
