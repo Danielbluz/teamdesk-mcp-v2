@@ -895,6 +895,14 @@ async def execute_tool(token: str, name: str, args: dict) -> dict:
     return {"result": result, "cache": "MISS" if name in CACHEABLE_OPERATIONS else "SKIP"}
 
 
+def _safe_int(value, field_name: str = "record_id") -> tuple[int, Optional[dict]]:
+    """Safely convert a value to int, returning (value, None) or (0, error_dict)."""
+    try:
+        return int(value), None
+    except (ValueError, TypeError):
+        return 0, {"error": f"{field_name} must be a valid integer, got: {value!r}"}
+
+
 async def _run_tool(token: str, name: str, args: dict) -> dict:
     """Execute tool with corrected TeamDesk API endpoints."""
     # Mask potentially sensitive data in logs (truncate long values)
@@ -948,7 +956,9 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         if err:
             return {"error": err}
         table = sanitize_table_name(args["table"])
-        record_id = int(args["record_id"])
+        record_id, err = _safe_int(args["record_id"])
+        if err:
+            return err
         params = {"id": record_id}
         if args.get("columns"):
             params["column"] = args["columns"]
@@ -980,7 +990,9 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         if err:
             return {"error": err}
         table = sanitize_table_name(args["table"])
-        record_id = int(args["record_id"])
+        record_id, err = _safe_int(args["record_id"])
+        if err:
+            return err
         # Validate/auto-correct field names
         upsert_check = check_upsert(args["data"])
         corrected_data = upsert_check["corrected"]
@@ -1000,7 +1012,9 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         if err:
             return {"error": err}
         table = sanitize_table_name(args["table"])
-        record_id = int(args["record_id"])
+        record_id, err = _safe_int(args["record_id"])
+        if err:
+            return err
         # CORRECT: GET {table}/delete.json?id=N (NOT DELETE {table}/{id}.json)
         return await http_client.request("GET", token, f"{table}/delete.json", params={"id": record_id})
 
@@ -1079,7 +1093,9 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
             return {"error": err}
         table = sanitize_table_name(args["table"])
         column = urllib.parse.quote(args["column"], safe="")
-        record_id = int(args["record_id"])
+        record_id, err = _safe_int(args["record_id"])
+        if err:
+            return err
         # CORRECT: {table}/{column}/attachment?id={row_id}
         # (NOT attachment.aspx?fid=...&guid=...)
         url = (
@@ -1532,8 +1548,14 @@ async def _run_tool(token: str, name: str, args: dict) -> dict:
         resolved_table = table_check["corrected"]
         table_enc = sanitize_table_name(resolved_table)
 
-        params1 = {"id": int(args["record_id_1"])}
-        params2 = {"id": int(args["record_id_2"])}
+        id1, err = _safe_int(args["record_id_1"], "record_id_1")
+        if err:
+            return err
+        id2, err = _safe_int(args["record_id_2"], "record_id_2")
+        if err:
+            return err
+        params1 = {"id": id1}
+        params2 = {"id": id2}
         if args.get("columns"):
             params1["column"] = args["columns"]
             params2["column"] = args["columns"]
