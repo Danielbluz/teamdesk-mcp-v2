@@ -10,12 +10,30 @@ services:
       - PYTHONUNBUFFERED=1
       - TEAMDESK_DATABASE_ID=${TEAMDESK_DATABASE_ID}
       - TEAMDESK_MASTER_TOKEN=${TEAMDESK_MASTER_TOKEN}
-      - TEAMDESK_API_KEYS_TABLE=${TEAMDESK_API_KEYS_TABLE:-API-Keys}
+      - TEAMDESK_API_KEYS_TABLE=Acesso
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8080
       - MCP_RATE_LIMIT=${MCP_RATE_LIMIT:-100}
       - MCP_CACHE_TTL=${MCP_CACHE_TTL:-300}
       - MCP_API_KEY_CACHE_TTL=${MCP_API_KEY_CACHE_TTL:-60}
       - MCP_CORS_ORIGINS=${MCP_CORS_ORIGINS:-}
+      - MCP_PUBLIC_URL=https://mcp-teamdesk.srv1083726.hstgr.cloud
     ports:
       - "8080:8080"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.teamdeskmcp.rule=Host(`mcp-teamdesk.srv1083726.hstgr.cloud`)
+      - traefik.http.routers.teamdeskmcp.tls=true
+      - traefik.http.routers.teamdeskmcp.entrypoints=web,websecure
+      - traefik.http.routers.teamdeskmcp.tls.certresolver=mytlschallenge
+      - traefik.http.services.teamdeskmcp.loadbalancer.server.port=8080
+      # - traefik.http.routers.teamdeskmcp.middlewares=security-headers@file
+      - traefik.docker.network=root_default
+    networks:
+      - default
+      - traefik
+
+networks:
+  traefik:
+    external: true
+    name: root_default

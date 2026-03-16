@@ -2175,9 +2175,9 @@ middleware = [
         CORSMiddleware,
         allow_origins=cors_origins or ["*"],
         allow_credentials=True,
-        allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-API-Key", "Authorization"],
-        expose_headers=["X-Cache", "X-RateLimit-Limit", "X-RateLimit-Remaining"],
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Content-Type", "X-API-Key", "Authorization", "Mcp-Session-Id"],
+        expose_headers=["X-Cache", "X-RateLimit-Limit", "X-RateLimit-Remaining", "Mcp-Session-Id"],
     ),
 ]
 
